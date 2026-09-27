@@ -47,7 +47,7 @@ def handle_disconnect():
 
     print(f"disconnected: {request.sid} (#{user_id})")
 
-    user_rooms = remove_user_from_active_rooms(user_id)
+    user_rooms, user_calls = remove_user_from_active_rooms(user_id)
 
     for room in user_rooms:
         emit(
@@ -57,5 +57,17 @@ def handle_disconnect():
                 "room": room
             },
             to=room,
+            include_self=False
+        )
+
+    for room in user_calls:
+        call_room = f"call:{room}"
+        emit(
+            "call_user_left",
+            {
+                "peerId": user_id,
+                "room": room
+            },
+            to=call_room,
             include_self=False
         )

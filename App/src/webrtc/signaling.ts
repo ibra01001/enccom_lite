@@ -42,12 +42,38 @@ export interface CallRingFailedPayload {
   message: string;
 }
 
+export interface CallStatusPayload {
+  room: string;
+  active: boolean;
+  participants: string[];
+  ringing?: boolean;
+  ringer?: string | null;
+  action?: string;
+}
+
+export interface CallSessionSyncPayload {
+  room: string;
+  participants: string[];
+}
+
+export interface CallEndedPayload {
+  room: string;
+}
+
 export interface SignalingHandlers {
   onUserJoined: (payload: CallUserJoinedPayload) => void;
   onOffer: (payload: CallOfferPayload) => void;
   onAnswer: (payload: CallAnswerPayload) => void;
   onIce: (payload: CallIcePayload) => void;
   onUserLeft: (payload: CallUserLeftPayload) => void;
+  onSessionSync?: (payload: CallSessionSyncPayload) => void;
+}
+
+/**
+ * Query active call status for a room.
+ */
+export function emitGetCallStatus(socket: Socket, room: string) {
+  socket.emit('get_call_status', { room });
 }
 
 /**
@@ -128,6 +154,7 @@ export function setupSignalingListeners(socket: Socket, handlers: SignalingHandl
   socket.on('call_ice', handlers.onIce);
   socket.on('call_user_left', handlers.onUserLeft);
   socket.on('peer_left', handlers.onUserLeft);
+  if (handlers.onSessionSync) socket.on('call_session_sync', handlers.onSessionSync);
 
   return () => {
     socket.off('call_user_joined', handlers.onUserJoined);
@@ -136,5 +163,6 @@ export function setupSignalingListeners(socket: Socket, handlers: SignalingHandl
     socket.off('call_ice', handlers.onIce);
     socket.off('call_user_left', handlers.onUserLeft);
     socket.off('peer_left', handlers.onUserLeft);
+    if (handlers.onSessionSync) socket.off('call_session_sync', handlers.onSessionSync);
   };
 }

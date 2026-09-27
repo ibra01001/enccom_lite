@@ -52,11 +52,42 @@ class RingtoneEngine {
     });
 
     el.addEventListener('error', () => {
-      console.warn(`[Ringtone] Failed to load ${RING_SRC}`);
+      console.warn(`[Ringtone] Failed to load ${RING_SRC}, falling back to synth chime`);
+      this.playSynthBeep(pattern);
     });
 
     this.players.set(pattern, el);
     return el;
+  }
+
+  private playSynthBeep(pattern: RingPattern) {
+    try {
+      const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      if (!AudioCtx) return;
+      const ctx = new AudioCtx();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.type = 'sine';
+      const now = ctx.currentTime;
+      if (pattern === 'incoming') {
+        osc.frequency.setValueAtTime(440, now);
+        osc.frequency.setValueAtTime(880, now + 0.15);
+        gain.gain.setValueAtTime(0.2, now);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.4);
+        osc.start(now);
+        osc.stop(now + 0.4);
+      } else {
+        osc.frequency.setValueAtTime(480, now);
+        gain.gain.setValueAtTime(0.15, now);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.3);
+        osc.start(now);
+        osc.stop(now + 0.3);
+      }
+    } catch {
+      // AudioContext unavailable
+    }
   }
 
   private async play(el: HTMLAudioElement) {

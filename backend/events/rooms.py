@@ -78,6 +78,8 @@ def handle_join_room(data):
     is_owner = (room_meta.get("owner") == user_id) if room != 'public' else False
     current_epoch = room_service.get_room_epoch(room)
 
+    call_info = room_service.get_call_info(room) if room != 'public' else {'active': False, 'participants': []}
+
     emit('room_joined', {
         'room': room,
         'name': room_meta.get('name', room) if room != 'public' else 'Public Chat',
@@ -85,7 +87,11 @@ def handle_join_room(data):
         'isOwner': is_owner,
         'activePeers': active_peers,
         'mls_enabled': room_meta.get('mls_enabled') == '1' if room != 'public' else False,
-        'epoch': current_epoch
+        'epoch': current_epoch,
+        'call': {
+            'active': call_info['active'],
+            'participants': call_info['participants']
+        }
     })
 
     # Notify existing room members so they can initiate MLS welcome exchange

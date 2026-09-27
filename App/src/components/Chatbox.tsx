@@ -12,9 +12,12 @@ import {
   emitCallRingCancel,
   emitCallRingAccept,
   emitCallRingDecline,
+  emitGetCallStatus,
   type CallIncomingPayload,
   type CallRingEndPayload,
   type CallRingFailedPayload,
+  type CallStatusPayload,
+  type CallEndedPayload,
 } from '../webrtc/signaling';
 import '../styles/features.css';
 
@@ -37,6 +40,12 @@ type CallPhase = 'idle' | 'ringing-out' | 'ringing-in' | 'in-call';
 interface IncomingRing {
   from: string;
   name: string;
+  room?: string;
+}
+
+interface ActiveCallState {
+  active: boolean;
+  participants: string[];
 }
 
 const RING_TIMEOUT_S = 35;
@@ -52,6 +61,7 @@ const Chatbox: FC = () => {
   const [showDebugger, setShowDebugger] = useState<boolean>(true);
   const [roomMeta, setRoomMeta] = useState<RoomMeta>({});
   const [callPhase, setCallPhase] = useState<CallPhase>('idle');
+  const [activeCall, setActiveCall] = useState<ActiveCallState | null>(null);
   const [incomingRing, setIncomingRing] = useState<IncomingRing | null>(null);
   const [declinedPeers, setDeclinedPeers] = useState<string[]>([]);
   const [ringSecondsLeft, setRingSecondsLeft] = useState<number>(RING_TIMEOUT_S);
@@ -253,6 +263,10 @@ const Chatbox: FC = () => {
       activePeers: string[];
       mls_enabled: boolean;
       epoch: number;
+      call?: {
+        active: boolean;
+        participants: string[];
+      };
     }
 
     const handleRoomJoined = (data: RoomJoinedPayload) => {
@@ -263,6 +277,15 @@ const Chatbox: FC = () => {
           activePeers: data.activePeers,
           epoch: data.epoch,
         });
+
+        if (data.call) {
+          setActiveCall(data.call.active && data.call.participants.length > 0 ? {
+            active: true,
+            participants: data.call.participants,
+          } : null);
+        } else {
+          setActiveCall(null);
+        }
 
         // 3-stage owner recovery on refresh:
         // B → restore from IndexedDB (preserves epoch)
@@ -346,7 +369,14 @@ const Chatbox: FC = () => {
   );
 
   const handleStartRing = useCallback(() => {
-    if (!socket || callPhaseRef.current !== 'idle') return;
+    if (!socket) return;
+    // If a call is already active, jump straight into it
+    if (activeCall?.active) {
+      setCallPhase('in-call');
+      setCallMinimized(false);
+      return;
+    }
+    if (callPhaseRef.current !== 'idle') return;
 
     setDeclinedPeers([]);
     setCallPhase('ringing-out');
@@ -358,24 +388,29 @@ const Chatbox: FC = () => {
         setCallPhase('idle');
       }
     });
-  }, [socket, currentRoom, startRingCountdown]);
+  }, [socket, currentRoom, activeCall, startRingCountdown]);
 
   const handleAcceptRing = useCallback(() => {
     if (!socket) return;
+    const targetRoom = incomingRing?.room || currentRoom;
     abortRing();
     setIncomingRing(null);
+    if (targetRoom !== currentRoom) {
+      setCurrentRoom(targetRoom);
+    }
     setCallMinimized(false);
     setCallPhase('in-call');
-    emitCallRingAccept(socket, currentRoom);
-  }, [socket, currentRoom, abortRing]);
+    emitCallRingAccept(socket, targetRoom);
+  }, [socket, currentRoom, incomingRing, abortRing]);
 
   const handleDeclineRing = useCallback(() => {
     if (!socket) return;
+    const targetRoom = incomingRing?.room || currentRoom;
     abortRing();
     setIncomingRing(null);
     setCallPhase('idle');
-    emitCallRingDecline(socket, currentRoom);
-  }, [socket, currentRoom, abortRing]);
+    emitCallRingDecline(socket, targetRoom);
+  }, [socket, currentRoom, incomingRing, abortRing]);
 
   const handleCancelRing = useCallback(() => {
     if (!socket) return;
@@ -390,10 +425,18 @@ const Chatbox: FC = () => {
     abortRing();
     setCallPhase('idle');
     setIncomingRing(null);
-  }, [abortRing]);
+    if (socket && currentRoom !== 'public') {
+      emitGetCallStatus(socket, currentRoom);
+    }
+  }, [socket, currentRoom, abortRing]);
 
   useEffect(() => {
     if (!socket) return;
+
+    // Check call status on room mount
+    if (currentRoom !== 'public') {
+      emitGetCallStatus(socket, currentRoom);
+    }
 
     const endOutgoingRing = () => {
       clearRingTimers();
@@ -405,17 +448,16 @@ const Chatbox: FC = () => {
 
     const handleIncoming = (data: CallIncomingPayload) => {
       if (!data?.from || data.from === myId) return;
-      // Only surface rings for the room currently open on this client
-      if (data.room !== currentRoom) return;
-      // Already busy in a call — let it go rather than stack overlays
-      if (callPhaseRef.current === 'in-call' || callPhaseRef.current === 'ringing-in') return;
+      // If already connected in a call, don't interrupt
+      if (callPhaseRef.current === 'in-call') return;
 
-      setIncomingRing({ from: data.from, name: data.name || currentRoom });
+      const ringRoom = data.room;
+      setIncomingRing({ from: data.from, name: data.name || ringRoom, room: ringRoom });
       setCallPhase('ringing-in');
       startRingtone('incoming');
       startRingCountdown(() => {
         if (callPhaseRef.current === 'ringing-in') {
-          emitCallRingDecline(socket, currentRoom);
+          emitCallRingDecline(socket, ringRoom);
           setCallPhase('idle');
           setIncomingRing(null);
         }
@@ -444,24 +486,48 @@ const Chatbox: FC = () => {
       endOutgoingRing();
     };
 
-    const handleRingAnswered = (data: CallRingEndPayload) => {
+    const handleRingAnswered = (data: CallRingEndPayload & { mutual?: boolean }) => {
       if (data?.room !== currentRoom) return;
-      // I accepted: the accept handler already moved me into the call
       if (data?.from === myId) return;
       const phase = callPhaseRef.current;
-      if (phase !== 'ringing-out' && phase !== 'ringing-in') return;
 
       clearRingTimers();
       stopRingtone();
       setIncomingRing(null);
 
-      if (phase === 'ringing-out') {
-        // I started this ring and someone picked up — join them
+      if (phase === 'ringing-out' || data.mutual) {
+        // I started this ring or mutual ring — join into the call
         setCallMinimized(false);
         setCallPhase('in-call');
-      } else {
-        // Another member answered first — the ring is over for me, I stay out
+      } else if (phase === 'ringing-in') {
+        // Another member answered the group call!
+        // Ringing tone stops so user isn't deafened, and active call state is enabled so they can click "Join"
         setCallPhase('idle');
+        setActiveCall((prev) => ({
+          active: true,
+          participants: prev?.participants ? [...prev.participants, data.from] : [data.from],
+        }));
+      }
+    };
+
+    const handleCallStatus = (data: CallStatusPayload) => {
+      if (data?.room !== currentRoom) return;
+      if (data.active && data.participants && data.participants.length > 0) {
+        setActiveCall({ active: true, participants: data.participants });
+        if (data.action === 'join_existing' && callPhaseRef.current === 'idle') {
+          setCallPhase('in-call');
+          setCallMinimized(false);
+        }
+      } else {
+        setActiveCall(null);
+      }
+    };
+
+    const handleCallEnded = (data: CallEndedPayload) => {
+      if (data?.room !== currentRoom) return;
+      setActiveCall(null);
+      if (callPhaseRef.current !== 'idle') {
+        endOutgoingRing();
       }
     };
 
@@ -470,6 +536,8 @@ const Chatbox: FC = () => {
     socket.on('call_ring_declined', handleRingDeclined);
     socket.on('call_ring_cancelled', handleRingCancelled);
     socket.on('call_ring_answered', handleRingAnswered);
+    socket.on('call_status', handleCallStatus);
+    socket.on('call_ended', handleCallEnded);
 
     return () => {
       socket.off('call_incoming', handleIncoming);
@@ -477,6 +545,8 @@ const Chatbox: FC = () => {
       socket.off('call_ring_declined', handleRingDeclined);
       socket.off('call_ring_cancelled', handleRingCancelled);
       socket.off('call_ring_answered', handleRingAnswered);
+      socket.off('call_status', handleCallStatus);
+      socket.off('call_ended', handleCallEnded);
     };
   }, [socket, myId, currentRoom, clearRingTimers, startRingCountdown]);
 
@@ -657,24 +727,23 @@ const Chatbox: FC = () => {
 
             {/* Enccom Telecom Carrier Call Toggle Button (Private Rooms Only) */}
             {isPrivateRoom && (
-              !isRinging ? (
-                <button
-                  type="button"
-                  onClick={handleStartRing}
-                  disabled={isInCall}
-                  className="group px-3 py-1.5   text-zinc-200 hover:text-white  flex items-center gap-1.5 font-['JetBrains_Mono',monospace] text-xs font-bold uppercase tracking-wider cursor-pointer transition-all shadow-sm disabled:opacity-40 disabled:cursor-not-allowed"
-                  title="Ring Every Member In This Room"
-                >
-                  <span className="material-symbols-outlined text-[16px] text-[#ff3535] group-hover:text-white transition-colors">
-                    <svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
-                      <path d="M0 0h24v24H0z" fill="none" />
-                      <path fill="currentColor" d="M20 17V7h2v10zm-2-2V9h2v6zM2 7h2v10H2zm14 0h2v10h-2zM4 5h12v2H4zm0 12h12v2H4z" />
-                    </svg>
-
-                  </span>
-
-                </button>
-              ) : (
+              isInCall ? (
+                <div className="flex items-center gap-1.5 font-['JetBrains_Mono',monospace]">
+                  <button
+                    type="button"
+                    onClick={() => setCallMinimized((v) => !v)}
+                    className={`px-3 py-1.5 rounded flex items-center gap-1.5 text-xs font-bold cursor-pointer uppercase tracking-wider transition-all ${callMinimized
+                      ? 'text-[#10b981]'
+                      : 'text-zinc-300 hover:text-white'
+                      }`}
+                    title={callMinimized ? 'Expand Video Stage' : 'Minimize to Header'}
+                  >
+                    <span className="material-symbols-outlined text-[16px]">
+                      {callMinimized ? 'sensors' : 'keyboard_arrow_down'}
+                    </span>
+                  </button>
+                </div>
+              ) : isRinging ? (
                 <div className="flex items-center gap-1.5 font-['JetBrains_Mono',monospace]">
                   <span
                     className="px-3 py-1.5 flex items-center gap-1.5 text-xs font-bold uppercase tracking-wider text-[#ff3535] border border-[#ff3535] bg-[#2e1616]"
@@ -688,28 +757,97 @@ const Chatbox: FC = () => {
                     {callPhase === 'ringing-in' ? 'Incoming' : 'Ringing'}
                   </span>
                 </div>
-              )
-            )}
-            {isPrivateRoom && isInCall && (
-              <div className="flex items-center gap-1.5 font-['JetBrains_Mono',monospace]">
+              ) : activeCall?.active ? (
                 <button
                   type="button"
-                  onClick={() => setCallMinimized((v) => !v)}
-                  className={`px-3 py-1.5 rounded flex items-center gap-1.5 text-xs font-bold cursor-pointer uppercase tracking-wider transition-all ${callMinimized
-                    ? 'text-[#10b981]'
-                    : 'text-zinc-300 hover:text-white'
-                    }`}
-                  title={callMinimized ? 'Expand Video Stage' : 'Minimize to Header'}
+                  onClick={() => {
+                    setCallPhase('in-call');
+                    setCallMinimized(false);
+                  }}
+                  className="px-3 py-1.5 bg-[#10b981]/20 hover:bg-[#10b981]/30 border border-[#10b981] text-[#10b981] rounded flex items-center gap-1.5 font-['JetBrains_Mono',monospace] text-xs font-bold uppercase tracking-wider cursor-pointer transition-all shadow-sm"
+                  title="Join Active Call"
                 >
-                  <span className="material-symbols-outlined text-[16px]">
-                    {callMinimized ? 'sensors' : 'keyboard_arrow_down'}
-                  </span>
-
+                  <span className="material-symbols-outlined text-[16px]">call</span>
+                  <span>Join Call ({activeCall.participants.length})</span>
                 </button>
-              </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={handleStartRing}
+                  className="group px-3 py-1.5 text-zinc-200 hover:text-white flex items-center gap-1.5 font-['JetBrains_Mono',monospace] text-xs font-bold uppercase tracking-wider cursor-pointer transition-all shadow-sm"
+                  title="Ring Every Member In This Room"
+                >
+                  <span className="material-symbols-outlined text-[16px] text-[#ff3535] group-hover:text-white transition-colors">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
+                      <path d="M0 0h24v24H0z" fill="none" />
+                      <path fill="currentColor" d="M20 17V7h2v10zm-2-2V9h2v6zM2 7h2v10H2zm14 0h2v10h-2zM4 5h12v2H4zm0 12h12v2H4z" />
+                    </svg>
+                  </span>
+                </button>
+              )
             )}
           </div>
         </header>
+
+        {/* Discord-style Active Call In Progress Banner */}
+        {isPrivateRoom && activeCall?.active && !isInCall && !isRinging && (
+          <div className="bg-[#14291c] border-b border-[#10b981]/30 px-6 py-2.5 flex items-center justify-between z-20 shrink-0 shadow-inner">
+            <div className="flex items-center gap-2.5">
+              <span className="w-2.5 h-2.5 rounded-full bg-[#10b981] ob-pulse" />
+              <div className="flex flex-col sm:flex-row sm:items-center sm:gap-2">
+                <span className="text-xs font-bold text-emerald-400 uppercase tracking-wider font-['JetBrains_Mono',monospace]">
+                  Call in Progress
+                </span>
+                <span className="text-[11px] text-zinc-400 font-['JetBrains_Mono',monospace]">
+                  ({activeCall.participants.length} connected: {activeCall.participants.map((p) => `#${p.slice(0, 4)}`).join(', ')})
+                </span>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setCallPhase('in-call');
+                setCallMinimized(false);
+              }}
+              className="px-4 py-1.5 bg-[#10b981] hover:bg-[#059669] text-white text-xs font-bold uppercase tracking-wider font-['JetBrains_Mono',monospace] rounded flex items-center gap-1.5 transition-colors cursor-pointer shadow-md"
+            >
+              <span className="material-symbols-outlined text-[16px]">call</span>
+              <span>Join Call</span>
+            </button>
+          </div>
+        )}
+
+        {/* Global Floating Notification if another room is ringing */}
+        {incomingRing && incomingRing.room && incomingRing.room !== currentRoom && (
+          <div className="fixed top-4 right-4 z-[70] bg-[#1e1e1e] border border-[#10b981] rounded-lg shadow-2xl p-4 flex items-center gap-4 max-w-sm font-['JetBrains_Mono',monospace]">
+            <div className="w-10 h-10 rounded-full bg-[#10b981]/20 flex items-center justify-center text-[#10b981] shrink-0">
+              <span className="material-symbols-outlined ob-pulse">notifications_active</span>
+            </div>
+            <div className="flex-1 min-w-0 text-left">
+              <p className="text-xs font-bold text-white truncate m-0">Incoming Group Call</p>
+              <p className="text-[11px] text-zinc-400 truncate m-0">#{incomingRing.from} in {incomingRing.name}</p>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={handleDeclineRing}
+                className="p-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-400 hover:text-white cursor-pointer"
+                title="Decline"
+              >
+                <span className="material-symbols-outlined text-[18px]">call_end</span>
+              </button>
+              <button
+                type="button"
+                onClick={handleAcceptRing}
+                className="px-2.5 py-1.5 rounded bg-[#10b981] hover:bg-[#059669] text-white text-xs font-bold flex items-center gap-1 cursor-pointer"
+                title="Accept and Join"
+              >
+                <span className="material-symbols-outlined text-[16px]">call</span>
+                Join
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Incoming Ring — takes over the screen like a Discord group call */}
         {isPrivateRoom && callPhase === 'ringing-in' && incomingRing && (

@@ -4,6 +4,7 @@ import type { Socket } from 'socket.io-client';
 import type { CallParticipant } from '../components/call/callTypes';
 
 import { PeerConnection } from './peerConnection';
+import { CandidateBuffer } from './ice';
 import {
   getMediaStream,
   getDisplayStream,
@@ -38,6 +39,7 @@ export function useGroupCall({ roomId, myId, socket }: UseGroupCallOptions) {
   const peersRef = useRef<Map<string, PeerConnection>>(new Map());
   const remoteStreamsRef = useRef<Map<string, MediaStream>>(new Map());
   const vadRef = useRef<VoiceActivityDetector>(new VoiceActivityDetector());
+  const earlyCandidateBufferRef = useRef<CandidateBuffer>(new CandidateBuffer());
   // Peers created before getMediaStream() resolves would have no local tracks
   // attached and never receive media, so every offer/answer awaits this.
   const localStreamReadyRef = useRef<Promise<void>>(Promise.resolve());
@@ -76,6 +78,7 @@ export function useGroupCall({ roomId, myId, socket }: UseGroupCallOptions) {
     }
     remoteStreamsRef.current.delete(peerId);
     vadRef.current.detachStream(peerId);
+    earlyCandidateBufferRef.current.clear(peerId);
 
     setParticipants((prev) => prev.filter((p) => p.id !== peerId));
   }, []);
@@ -86,53 +89,58 @@ export function useGroupCall({ roomId, myId, socket }: UseGroupCallOptions) {
       let peer = peersRef.current.get(peerId);
       if (peer) return peer;
 
-      peer = new PeerConnection(peerId, localStreamRef.current, {
-        onIceCandidate: (candidate) => {
-          if (socket) emitCallIce(socket, peerId, candidate);
-        },
-        onTrack: (track, stream) => {
-          let remoteStream = remoteStreamsRef.current.get(peerId);
-          if (!remoteStream) {
-            remoteStream = new MediaStream();
-            remoteStreamsRef.current.set(peerId, remoteStream);
-          }
-          if (!remoteStream.getTracks().includes(track)) {
-            remoteStream.addTrack(track);
-          }
-
-          if (track.kind === 'audio') {
-            vadRef.current.attachStream(peerId, stream);
-          }
-
-          setParticipants((prev) => {
-            const exists = prev.find((p) => p.id === peerId);
-            if (exists) {
-              return prev.map((p) => (p.id === peerId ? { ...p, stream: remoteStream } : p));
+      peer = new PeerConnection(
+        peerId,
+        localStreamRef.current,
+        {
+          onIceCandidate: (candidate) => {
+            if (socket) emitCallIce(socket, peerId, candidate);
+          },
+          onTrack: (track, stream) => {
+            let remoteStream = remoteStreamsRef.current.get(peerId);
+            if (!remoteStream) {
+              remoteStream = new MediaStream();
+              remoteStreamsRef.current.set(peerId, remoteStream);
             }
-            return [
-              ...prev,
-              {
-                id: peerId,
-                name: `PEER_${peerId.slice(0, 4).toUpperCase()}`,
-                isLocal: false,
-                isMuted: false,
-                isVideoOn: true,
-                isSpeaking: false,
-                volume: 100,
-                signalStrength: 3,
-                role: 'PEER_NODE',
-                avatarColor: '#242424',
-                stream: remoteStream,
-              },
-            ];
-          });
+            if (!remoteStream.getTracks().includes(track)) {
+              remoteStream.addTrack(track);
+            }
+
+            if (track.kind === 'audio') {
+              vadRef.current.attachStream(peerId, stream);
+            }
+
+            setParticipants((prev) => {
+              const exists = prev.find((p) => p.id === peerId);
+              if (exists) {
+                return prev.map((p) => (p.id === peerId ? { ...p, stream: remoteStream } : p));
+              }
+              return [
+                ...prev,
+                {
+                  id: peerId,
+                  name: `PEER_${peerId.slice(0, 4).toUpperCase()}`,
+                  isLocal: false,
+                  isMuted: false,
+                  isVideoOn: true,
+                  isSpeaking: false,
+                  volume: 100,
+                  signalStrength: 3,
+                  role: 'PEER_NODE',
+                  avatarColor: '#242424',
+                  stream: remoteStream,
+                },
+              ];
+            });
+          },
+          onConnectionStateChange: (state) => {
+            if (state === 'disconnected' || state === 'failed' || state === 'closed') {
+              removePeer(peerId);
+            }
+          },
         },
-        onConnectionStateChange: (state) => {
-          if (state === 'disconnected' || state === 'failed' || state === 'closed') {
-            removePeer(peerId);
-          }
-        },
-      });
+        earlyCandidateBufferRef.current
+      );
 
       peersRef.current.set(peerId, peer);
       return peer;
@@ -204,11 +212,22 @@ export function useGroupCall({ roomId, myId, socket }: UseGroupCallOptions) {
         const peer = peersRef.current.get(sender);
         if (peer) {
           await peer.addIceCandidate(candidate);
+        } else {
+          earlyCandidateBufferRef.current.addCandidate(sender, candidate);
         }
       },
 
       onUserLeft: ({ peerId }) => {
         removePeer(peerId);
+      },
+
+      onSessionSync: async ({ participants: currentPeers }) => {
+        await localStreamReadyRef.current;
+        for (const peerId of currentPeers) {
+          if (peerId !== myId && !peersRef.current.has(peerId)) {
+            getOrCreatePeer(peerId);
+          }
+        }
       },
     });
 

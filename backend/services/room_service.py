@@ -170,8 +170,72 @@ def get_room_epoch(room_id):
     return int(current_epoch_str) if current_epoch_str is not None else 0
 
 def remove_user_from_active_rooms(user_id):
-    """Remove user from active lists of all rooms on disconnect. Returns user_rooms."""
+    """Remove user from active lists of all rooms on disconnect. Returns (user_rooms, user_calls)."""
     user_rooms = r.smembers(f"user:{user_id}:rooms") or set()
     for rm in user_rooms:
         r.srem(f"room:{rm}:active_users", user_id)
-    return user_rooms
+
+    # Also clean up from any active calls
+    user_calls = r.smembers(f"user:{user_id}:active_calls") or set()
+    for rm in user_calls:
+        r.srem(f"room:{rm}:call_participants", user_id)
+    r.delete(f"user:{user_id}:active_calls")
+
+    return user_rooms, user_calls
+
+# ============================================================
+# Active Call State Management
+# ============================================================
+
+def add_call_participant(room_id, user_id):
+    """Add a user to the active call session in a room."""
+    if not room_id or room_id == 'public':
+        return []
+    pipe = r.pipeline()
+    pipe.sadd(f"room:{room_id}:call_participants", user_id)
+    pipe.expire(f"room:{room_id}:call_participants", TTL_SECONDS)
+    pipe.sadd(f"user:{user_id}:active_calls", room_id)
+    pipe.expire(f"user:{user_id}:active_calls", TTL_SECONDS)
+    pipe.execute()
+    return get_call_participants(room_id)
+
+def remove_call_participant(room_id, user_id):
+    """Remove a user from the active call session in a room."""
+    if not room_id or room_id == 'public':
+        return []
+    pipe = r.pipeline()
+    pipe.srem(f"room:{room_id}:call_participants", user_id)
+    pipe.srem(f"user:{user_id}:active_calls", room_id)
+    pipe.execute()
+    return get_call_participants(room_id)
+
+def get_call_participants(room_id):
+    """Get active call participant user IDs in a room."""
+    if not room_id or room_id == 'public':
+        return []
+    return list(r.smembers(f"room:{room_id}:call_participants") or set())
+
+def get_call_info(room_id):
+    """Get status dictionary for active call in a room."""
+    if not room_id or room_id == 'public':
+        return {'active': False, 'participants': [], 'ringing': False, 'ringer': None}
+    participants = get_call_participants(room_id)
+    ringer = r.get(f"room:{room_id}:ringing")
+    if isinstance(ringer, bytes):
+        ringer = ringer.decode()
+    return {
+        'active': len(participants) > 0,
+        'participants': participants,
+        'ringing': bool(ringer),
+        'ringer': ringer
+    }
+
+def clear_call(room_id):
+    """Clear all call participants and ringing state for a room."""
+    if not room_id or room_id == 'public':
+        return
+    pipe = r.pipeline()
+    pipe.delete(f"room:{room_id}:call_participants")
+    pipe.delete(f"room:{room_id}:ringing")
+    pipe.execute()
+

@@ -15,12 +15,18 @@ export interface PeerConnectionCallbacks {
 export class PeerConnection {
   readonly peerId: string;
   private pc: RTCPeerConnection;
-  private candidateBuffer = new CandidateBuffer();
+  private candidateBuffer: CandidateBuffer;
   private callbacks: PeerConnectionCallbacks;
 
-  constructor(peerId: string, localStream: MediaStream | null, callbacks: PeerConnectionCallbacks) {
+  constructor(
+    peerId: string,
+    localStream: MediaStream | null,
+    callbacks: PeerConnectionCallbacks,
+    candidateBuffer?: CandidateBuffer
+  ) {
     this.peerId = peerId;
     this.callbacks = callbacks;
+    this.candidateBuffer = candidateBuffer || new CandidateBuffer();
     this.pc = new RTCPeerConnection(RTC_CONFIG);
 
     // Attach local media tracks if available
