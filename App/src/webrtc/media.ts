@@ -138,7 +138,7 @@ export class VoiceActivityDetector {
     if (this.animId) cancelAnimationFrame(this.animId);
     this.analysers.clear();
     if (this.ctx && this.ctx.state !== 'closed') {
-      this.ctx.close().catch(() => {});
+      this.ctx.close().catch(() => { });
     }
   }
 }
