@@ -38,6 +38,9 @@ export function useGroupCall({ roomId, myId, socket }: UseGroupCallOptions) {
   const peersRef = useRef<Map<string, PeerConnection>>(new Map());
   const remoteStreamsRef = useRef<Map<string, MediaStream>>(new Map());
   const vadRef = useRef<VoiceActivityDetector>(new VoiceActivityDetector());
+  // Peers created before getMediaStream() resolves would have no local tracks
+  // attached and never receive media, so every offer/answer awaits this.
+  const localStreamReadyRef = useRef<Promise<void>>(Promise.resolve());
 
   // Initialize local participant entry
   useEffect(() => {
@@ -164,6 +167,8 @@ export function useGroupCall({ roomId, myId, socket }: UseGroupCallOptions) {
     const unsubscribe = setupSignalingListeners(socket, {
       onUserJoined: async ({ peerId }) => {
         if (peerId === myId) return;
+        // Wait for our own media so the offer actually carries our tracks
+        await localStreamReadyRef.current;
         const peer = getOrCreatePeer(peerId);
         try {
           const offer = await peer.createOffer();
@@ -174,6 +179,8 @@ export function useGroupCall({ roomId, myId, socket }: UseGroupCallOptions) {
       },
 
       onOffer: async ({ sender, sdp }) => {
+        // Same here: answering with no local tracks would leave us transmitless
+        await localStreamReadyRef.current;
         const peer = getOrCreatePeer(sender);
         try {
           const answer = await peer.handleOffer(sdp);
@@ -205,10 +212,16 @@ export function useGroupCall({ roomId, myId, socket }: UseGroupCallOptions) {
       },
     });
 
+    let tornDown = false;
+
     // Capture media and announce call join
     const startCall = async () => {
       try {
         const { stream, hasVideo } = await getMediaStream(true, true);
+        if (tornDown) {
+          stopAllTracks(stream);
+          return;
+        }
         localStreamRef.current = stream;
         vadRef.current.attachStream('local', stream);
 
@@ -220,13 +233,16 @@ export function useGroupCall({ roomId, myId, socket }: UseGroupCallOptions) {
       } catch (err) {
         console.error('[Mesh] Media access failed:', err);
       }
-
-      emitCallJoin(socket, roomId);
     };
 
-    startCall();
+    localStreamReadyRef.current = startCall().then(() => {
+      // Don't announce a join for a call we already hung up on
+      if (tornDown) return;
+      emitCallJoin(socket, roomId);
+    });
 
     return () => {
+      tornDown = true;
       unsubscribe();
       emitCallLeave(socket, roomId);
 

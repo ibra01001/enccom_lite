@@ -26,6 +26,22 @@ export interface CallUserLeftPayload {
   room?: string;
 }
 
+export interface CallIncomingPayload {
+  from: string;
+  room: string;
+  name?: string;
+}
+
+export interface CallRingEndPayload {
+  room: string;
+  from: string;
+}
+
+export interface CallRingFailedPayload {
+  room?: string;
+  message: string;
+}
+
 export interface SignalingHandlers {
   onUserJoined: (payload: CallUserJoinedPayload) => void;
   onOffer: (payload: CallOfferPayload) => void;
@@ -70,8 +86,40 @@ export function emitCallIce(socket: Socket, target: string, candidate: RTCIceCan
 }
 
 /**
+ * Ring every member of a room. Nobody joins the call mesh until someone accepts.
+ */
+export function emitCallRing(socket: Socket, room: string) {
+  socket.emit('call_ring', { room });
+}
+
+/**
+ * Caller stopped ringing before anyone picked up.
+ */
+export function emitCallRingCancel(socket: Socket, room: string) {
+  socket.emit('call_ring_cancel', { room });
+}
+
+/**
+ * Accept an incoming group ring and join the call mesh.
+ */
+export function emitCallRingAccept(socket: Socket, room: string) {
+  socket.emit('call_ring_accept', { room });
+}
+
+/**
+ * Dismiss an incoming group ring.
+ */
+export function emitCallRingDecline(socket: Socket, room: string) {
+  socket.emit('call_ring_decline', { room });
+}
+
+/**
  * Subscribe to all call signaling events from the server.
  * Returns an unsubscribe cleanup callback.
+ *
+ * NOTE: ring events are deliberately NOT wired here — this listener only runs
+ * while inside a call, and a ring must be receivable before joining one.
+ * Subscribe to call_incoming / call_ring_* at the room level instead.
  */
 export function setupSignalingListeners(socket: Socket, handlers: SignalingHandlers): () => void {
   socket.on('call_user_joined', handlers.onUserJoined);

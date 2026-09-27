@@ -1,10 +1,21 @@
-import { useState, useRef, useEffect, type FC, type KeyboardEvent } from 'react';
+import { useState, useRef, useEffect, useCallback, type FC, type KeyboardEvent } from 'react';
 import { useSocket } from '../context/SocketContext';
 import Rooms from './Rooms';
 import { useMls } from '../context/MlsContext';
 import MlsDebugger from './MlsDebugger';
 import { getCachedMessages } from '../utils/indexedDb';
 import VideoCall from './call/call';
+import CallRingOverlay from './call/CallRingOverlay';
+import { startRingtone, stopRingtone } from '../webrtc/ringtone';
+import {
+  emitCallRing,
+  emitCallRingCancel,
+  emitCallRingAccept,
+  emitCallRingDecline,
+  type CallIncomingPayload,
+  type CallRingEndPayload,
+  type CallRingFailedPayload,
+} from '../webrtc/signaling';
 import '../styles/features.css';
 
 import type {
@@ -20,6 +31,16 @@ interface RoomMeta {
   epoch?: number;
 }
 
+/** idle -> ringing-out -> in-call, with ringing-in reachable from idle. */
+type CallPhase = 'idle' | 'ringing-out' | 'ringing-in' | 'in-call';
+
+interface IncomingRing {
+  from: string;
+  name: string;
+}
+
+const RING_TIMEOUT_S = 35;
+
 const Chatbox: FC = () => {
   const [currentRoom, setCurrentRoom] = useState<string>(() => {
     const params = new URLSearchParams(window.location.search);
@@ -30,7 +51,10 @@ const Chatbox: FC = () => {
   const [joinError, setJoinError] = useState<string | null>(null);
   const [showDebugger, setShowDebugger] = useState<boolean>(true);
   const [roomMeta, setRoomMeta] = useState<RoomMeta>({});
-  const [isInCall, setIsInCall] = useState<boolean>(false);
+  const [callPhase, setCallPhase] = useState<CallPhase>('idle');
+  const [incomingRing, setIncomingRing] = useState<IncomingRing | null>(null);
+  const [declinedPeers, setDeclinedPeers] = useState<string[]>([]);
+  const [ringSecondsLeft, setRingSecondsLeft] = useState<number>(RING_TIMEOUT_S);
   const [callMinimized, setCallMinimized] = useState<boolean>(false);
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(false);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -38,6 +62,10 @@ const Chatbox: FC = () => {
   const swipeContainerRef = useRef<HTMLDivElement>(null);
   const nextId = useRef<number>(1);
   const clientMsgId = useRef<number>(0);
+  // Read inside socket listeners that must stay subscribed across phase changes
+  const callPhaseRef = useRef<CallPhase>('idle');
+  const ringDeadlineRef = useRef<number | null>(null);
+  const tickRef = useRef<number | null>(null);
   const { socket, myId } = useSocket();
   const {
     hasGroup,
@@ -51,11 +79,38 @@ const Chatbox: FC = () => {
 
   const isPrivateRoom = currentRoom !== 'public';
   const isGroupActive = hasGroup(currentRoom);
+  const isInCall = callPhase === 'in-call';
+  const isRinging = callPhase === 'ringing-in' || callPhase === 'ringing-out';
+  const otherMemberCount = (roomMeta.activePeers || []).filter((p) => p !== myId).length;
+
+  const clearRingTimers = useCallback(() => {
+    if (ringDeadlineRef.current !== null) {
+      window.clearTimeout(ringDeadlineRef.current);
+      ringDeadlineRef.current = null;
+    }
+    if (tickRef.current !== null) {
+      window.clearInterval(tickRef.current);
+      tickRef.current = null;
+    }
+  }, []);
+
+  const abortRing = useCallback(() => {
+    clearRingTimers();
+    stopRingtone();
+  }, [clearRingTimers]);
+
+  // Keep the ref in sync so long-lived socket listeners can read the live phase
+  useEffect(() => {
+    callPhaseRef.current = callPhase;
+  }, [callPhase]);
 
   // Pre-load locally cached plaintext messages from IndexedDB on room enter or refresh
   useEffect(() => {
     // End any active call and reset call state when switching rooms
-    setIsInCall(false);
+    abortRing();
+    setCallPhase('idle');
+    setIncomingRing(null);
+    setDeclinedPeers([]);
     setCallMinimized(false);
 
     let cancelled = false;
@@ -78,7 +133,10 @@ const Chatbox: FC = () => {
     return () => {
       cancelled = true;
     };
-  }, [currentRoom]);
+  }, [currentRoom, abortRing]);
+
+  // Stop the ringtone if the component unmounts mid-ring
+  useEffect(() => abortRing, [abortRing]);
 
   // When joining or refreshing into a private room without an active group, request welcome from peers
   useEffect(() => {
@@ -267,6 +325,161 @@ const Chatbox: FC = () => {
     };
   }, [socket, currentRoom, decryptMessage, myId, hasGroup, restoreGroupAsOwner, requestWelcome, recreateGroupAsOwner]);
 
+  // ============================================================
+  // Group Ring — ring every member of the room before anyone joins
+  // ============================================================
+  const startRingCountdown = useCallback(
+    (onExpire: () => void) => {
+      clearRingTimers();
+      setRingSecondsLeft(RING_TIMEOUT_S);
+      ringDeadlineRef.current = window.setTimeout(() => {
+        // Tear the tick down before handing off, or it runs forever
+        clearRingTimers();
+        setRingSecondsLeft(RING_TIMEOUT_S);
+        onExpire();
+      }, RING_TIMEOUT_S * 1000);
+      tickRef.current = window.setInterval(() => {
+        setRingSecondsLeft((s) => (s > 0 ? s - 1 : 0));
+      }, 1000);
+    },
+    [clearRingTimers]
+  );
+
+  const handleStartRing = useCallback(() => {
+    if (!socket || callPhaseRef.current !== 'idle') return;
+
+    setDeclinedPeers([]);
+    setCallPhase('ringing-out');
+    emitCallRing(socket, currentRoom);
+    startRingtone('outgoing');
+    startRingCountdown(() => {
+      if (callPhaseRef.current === 'ringing-out') {
+        emitCallRingCancel(socket, currentRoom);
+        setCallPhase('idle');
+      }
+    });
+  }, [socket, currentRoom, startRingCountdown]);
+
+  const handleAcceptRing = useCallback(() => {
+    if (!socket) return;
+    abortRing();
+    setIncomingRing(null);
+    setCallMinimized(false);
+    setCallPhase('in-call');
+    emitCallRingAccept(socket, currentRoom);
+  }, [socket, currentRoom, abortRing]);
+
+  const handleDeclineRing = useCallback(() => {
+    if (!socket) return;
+    abortRing();
+    setIncomingRing(null);
+    setCallPhase('idle');
+    emitCallRingDecline(socket, currentRoom);
+  }, [socket, currentRoom, abortRing]);
+
+  const handleCancelRing = useCallback(() => {
+    if (!socket) return;
+    abortRing();
+    setCallPhase('idle');
+    setDeclinedPeers([]);
+    setRingSecondsLeft(RING_TIMEOUT_S);
+    emitCallRingCancel(socket, currentRoom);
+  }, [socket, currentRoom, abortRing]);
+
+  const handleLeaveCall = useCallback(() => {
+    abortRing();
+    setCallPhase('idle');
+    setIncomingRing(null);
+  }, [abortRing]);
+
+  useEffect(() => {
+    if (!socket) return;
+
+    const endOutgoingRing = () => {
+      clearRingTimers();
+      stopRingtone();
+      setCallPhase((p) => (p === 'ringing-out' || p === 'ringing-in' ? 'idle' : p));
+      setIncomingRing(null);
+      setRingSecondsLeft(RING_TIMEOUT_S);
+    };
+
+    const handleIncoming = (data: CallIncomingPayload) => {
+      if (!data?.from || data.from === myId) return;
+      // Only surface rings for the room currently open on this client
+      if (data.room !== currentRoom) return;
+      // Already busy in a call — let it go rather than stack overlays
+      if (callPhaseRef.current === 'in-call' || callPhaseRef.current === 'ringing-in') return;
+
+      setIncomingRing({ from: data.from, name: data.name || currentRoom });
+      setCallPhase('ringing-in');
+      startRingtone('incoming');
+      startRingCountdown(() => {
+        if (callPhaseRef.current === 'ringing-in') {
+          emitCallRingDecline(socket, currentRoom);
+          setCallPhase('idle');
+          setIncomingRing(null);
+        }
+      });
+    };
+
+    const handleRingFailed = (data: CallRingFailedPayload) => {
+      if (data?.room && data.room !== currentRoom) return;
+      clearRingTimers();
+      stopRingtone();
+      setCallPhase('idle');
+      setDeclinedPeers([]);
+      setJoinError(data?.message || 'Could not start the group call.');
+    };
+
+    const handleRingDeclined = (data: CallRingEndPayload) => {
+      if (data?.from === myId) return;
+      if (data?.room !== currentRoom) return;
+      if (callPhaseRef.current !== 'ringing-out') return;
+      setDeclinedPeers((prev) => (prev.includes(data.from) ? prev : [...prev, data.from]));
+    };
+
+    const handleRingCancelled = (data: CallRingEndPayload) => {
+      if (data?.from === myId) return;
+      if (data?.room !== currentRoom) return;
+      endOutgoingRing();
+    };
+
+    const handleRingAnswered = (data: CallRingEndPayload) => {
+      if (data?.room !== currentRoom) return;
+      // I accepted: the accept handler already moved me into the call
+      if (data?.from === myId) return;
+      const phase = callPhaseRef.current;
+      if (phase !== 'ringing-out' && phase !== 'ringing-in') return;
+
+      clearRingTimers();
+      stopRingtone();
+      setIncomingRing(null);
+
+      if (phase === 'ringing-out') {
+        // I started this ring and someone picked up — join them
+        setCallMinimized(false);
+        setCallPhase('in-call');
+      } else {
+        // Another member answered first — the ring is over for me, I stay out
+        setCallPhase('idle');
+      }
+    };
+
+    socket.on('call_incoming', handleIncoming);
+    socket.on('call_ring_failed', handleRingFailed);
+    socket.on('call_ring_declined', handleRingDeclined);
+    socket.on('call_ring_cancelled', handleRingCancelled);
+    socket.on('call_ring_answered', handleRingAnswered);
+
+    return () => {
+      socket.off('call_incoming', handleIncoming);
+      socket.off('call_ring_failed', handleRingFailed);
+      socket.off('call_ring_declined', handleRingDeclined);
+      socket.off('call_ring_cancelled', handleRingCancelled);
+      socket.off('call_ring_answered', handleRingAnswered);
+    };
+  }, [socket, myId, currentRoom, clearRingTimers, startRingCountdown]);
+
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
@@ -444,15 +657,13 @@ const Chatbox: FC = () => {
 
             {/* Enccom Telecom Carrier Call Toggle Button (Private Rooms Only) */}
             {isPrivateRoom && (
-              !isInCall ? (
+              !isRinging ? (
                 <button
                   type="button"
-                  onClick={() => {
-                    setIsInCall(true);
-                    setCallMinimized(false);
-                  }}
-                  className="group px-3 py-1.5   text-zinc-200 hover:text-white  flex items-center gap-1.5 font-['JetBrains_Mono',monospace] text-xs font-bold uppercase tracking-wider cursor-pointer transition-all shadow-sm"
-                  title="Initialize Encrypted Group Voice/Video Stream"
+                  onClick={handleStartRing}
+                  disabled={isInCall}
+                  className="group px-3 py-1.5   text-zinc-200 hover:text-white  flex items-center gap-1.5 font-['JetBrains_Mono',monospace] text-xs font-bold uppercase tracking-wider cursor-pointer transition-all shadow-sm disabled:opacity-40 disabled:cursor-not-allowed"
+                  title="Ring Every Member In This Room"
                 >
                   <span className="material-symbols-outlined text-[16px] text-[#ff3535] group-hover:text-white transition-colors">
                     <svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
@@ -465,34 +676,73 @@ const Chatbox: FC = () => {
                 </button>
               ) : (
                 <div className="flex items-center gap-1.5 font-['JetBrains_Mono',monospace]">
-                  <button
-                    type="button"
-                    onClick={() => setCallMinimized((v) => !v)}
-                    className={`px-3 py-1.5 rounded flex items-center gap-1.5 text-xs font-bold cursor-pointer uppercase tracking-wider transition-all ${callMinimized
-                      ? 'text-[#10b981]'
-                      : 'text-zinc-300 hover:text-white'
-                      }`}
-                    title={callMinimized ? 'Expand Video Stage' : 'Minimize to Header'}
+                  <span
+                    className="px-3 py-1.5 flex items-center gap-1.5 text-xs font-bold uppercase tracking-wider text-[#ff3535] border border-[#ff3535] bg-[#2e1616]"
+                    title={
+                      callPhase === 'ringing-in'
+                        ? `Incoming call from #${incomingRing?.from ?? '...'}`
+                        : `Ringing ${otherMemberCount} member${otherMemberCount === 1 ? '' : 's'}`
+                    }
                   >
-                    <span className="material-symbols-outlined text-[16px]">
-                      {callMinimized ? 'sensors' : 'keyboard_arrow_down'}
-                    </span>
-
-                  </button>
+                    <span className="material-symbols-outlined text-[16px] ob-pulse">notifications_active</span>
+                    {callPhase === 'ringing-in' ? 'Incoming' : 'Ringing'}
+                  </span>
                 </div>
               )
+            )}
+            {isPrivateRoom && isInCall && (
+              <div className="flex items-center gap-1.5 font-['JetBrains_Mono',monospace]">
+                <button
+                  type="button"
+                  onClick={() => setCallMinimized((v) => !v)}
+                  className={`px-3 py-1.5 rounded flex items-center gap-1.5 text-xs font-bold cursor-pointer uppercase tracking-wider transition-all ${callMinimized
+                    ? 'text-[#10b981]'
+                    : 'text-zinc-300 hover:text-white'
+                    }`}
+                  title={callMinimized ? 'Expand Video Stage' : 'Minimize to Header'}
+                >
+                  <span className="material-symbols-outlined text-[16px]">
+                    {callMinimized ? 'sensors' : 'keyboard_arrow_down'}
+                  </span>
+
+                </button>
+              </div>
             )}
           </div>
         </header>
 
-        {/* Video Call Stage (Only in Private Rooms when active and not minimized) */}
+        {/* Incoming Ring — takes over the screen like a Discord group call */}
+        {isPrivateRoom && callPhase === 'ringing-in' && incomingRing && (
+          <CallRingOverlay
+            mode="incoming"
+            peerId={incomingRing.from}
+            roomName={incomingRing.name}
+            secondsLeft={ringSecondsLeft}
+            onAccept={handleAcceptRing}
+            onDecline={handleDeclineRing}
+          />
+        )}
+
+        {/* Outgoing Ring — replaces the chat stream until someone picks up */}
         {isPrivateRoom && isInCall && !callMinimized ? (
           <div className="flex-1 min-h-0 overflow-hidden relative">
             <VideoCall
               roomId={currentRoom}
               isPrivateRoom={isPrivateRoom}
               myId={myId}
-              onClose={() => setIsInCall(false)}
+              onClose={handleLeaveCall}
+            />
+          </div>
+        ) : isPrivateRoom && callPhase === 'ringing-out' ? (
+          <div className="flex-1 min-h-0 overflow-hidden relative">
+            <CallRingOverlay
+              mode="outgoing"
+              peerId={myId ?? '??'}
+              roomName={currentRoom === 'public' ? 'Public Chat' : currentRoom}
+              memberCount={otherMemberCount + (myId ? 1 : 0)}
+              declinedPeers={declinedPeers}
+              secondsLeft={ringSecondsLeft}
+              onDecline={handleCancelRing}
             />
           </div>
         ) : (
