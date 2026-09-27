@@ -3,6 +3,7 @@
 import json
 from extensions import r
 from config import MAX_HISTORY, TTL_SECONDS, MAX_MSG_BYTES
+from services.room_service import refresh_room_ttl
 
 def validate_message_payload(msg, room_meta):
     """
@@ -33,6 +34,9 @@ def save_message(msg):
         pipe.ltrim(room_key, 0, MAX_HISTORY - 1)
         pipe.expire(room_key, TTL_SECONDS)
         pipe.execute()
+        # Slide TTL on all room keys so active sessions are never evicted
+        sender_id = msg.get('senderId')
+        refresh_room_ttl(room, user_id=sender_id)
     except Exception as e:
         print(f"Error saving message to Redis: {e}")
 

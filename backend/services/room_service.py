@@ -126,6 +126,26 @@ def get_room_metadata(room_id):
         return {}
     return r.hgetall(f"chat:room:{room_id}")
 
+def refresh_room_ttl(room_id, user_id=None):
+    """
+    Slide the TTL on all keys tied to a room whenever there is activity
+    (message sent, MLS commit, etc.).  This prevents Redis from evicting
+    an actively-used room mid-session.
+    """
+    if not room_id or room_id == 'public':
+        return
+    pipe = r.pipeline()
+    # Core room keys
+    pipe.expire(f"chat:room:{room_id}", TTL_SECONDS)
+    pipe.expire(f"chat:messages:{room_id}", TTL_SECONDS)
+    pipe.expire(f"room:{room_id}:epoch", TTL_SECONDS)
+    pipe.expire(f"room:{room_id}:commits", TTL_SECONDS)
+    pipe.expire(f"room:{room_id}:active_users", TTL_SECONDS)
+    # Caller's membership set (if known)
+    if user_id:
+        pipe.expire(f"user:{user_id}:rooms", TTL_SECONDS)
+    pipe.execute()
+
 def join_room_record(user_id, room_id):
     """Record user in room active users and user's rooms set."""
     if room_id != 'public':

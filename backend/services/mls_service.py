@@ -1,6 +1,7 @@
 import json
 from extensions import r
 from config import MAX_KEY_PACKAGES, MAX_COMMIT_HISTORY, TTL_SECONDS
+from services.room_service import refresh_room_ttl
 
 def save_key_packages(user_id, key_packages):
     """Register a fresh pool of key packages for a user."""
@@ -77,6 +78,9 @@ def advance_epoch_and_store_commit(room, expected_epoch, commit_payload):
     pipe.ltrim(f"room:{room}:commits", -MAX_COMMIT_HISTORY, -1)
     pipe.expire(f"room:{room}:commits", TTL_SECONDS)
     pipe.execute()
+
+    # Slide TTL on all room keys so active MLS sessions are never evicted
+    refresh_room_ttl(room)
 
     return True, None, current_epoch, new_epoch
 
