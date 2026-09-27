@@ -20,10 +20,12 @@ def create_room(user_id, raw_name=None):
         "created_at": time.time(),
         "mls_enabled": "1"
     })
+    pipe.expire(f"chat:room:{room_name}", TTL_SECONDS)
     # 2. Add room to creator's personal room set
     pipe.sadd(f"user:{user_id}:rooms", room_name)
+    pipe.expire(f"user:{user_id}:rooms", TTL_SECONDS)
     # 3. Initialize room epoch counter
-    pipe.set(f"room:{room_name}:epoch", "0")
+    pipe.set(f"room:{room_name}:epoch", "0", ex=TTL_SECONDS)
     # 4. Initialize room message history
     room_key = f"chat:messages:{room_name}"
     pipe.lpush(room_key, json.dumps({
@@ -127,9 +129,12 @@ def get_room_metadata(room_id):
 def join_room_record(user_id, room_id):
     """Record user in room active users and user's rooms set."""
     if room_id != 'public':
-        r.sadd(f"user:{user_id}:rooms", room_id)
-        r.sadd(f"room:{room_id}:active_users", user_id)
-        r.expire(f"room:{room_id}:active_users", TTL_SECONDS)
+        pipe = r.pipeline()
+        pipe.sadd(f"user:{user_id}:rooms", room_id)
+        pipe.expire(f"user:{user_id}:rooms", TTL_SECONDS)
+        pipe.sadd(f"room:{room_id}:active_users", user_id)
+        pipe.expire(f"room:{room_id}:active_users", TTL_SECONDS)
+        pipe.execute()
 
 def get_active_peers(room_id):
     """Get active peer user IDs in a room."""
