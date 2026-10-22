@@ -910,9 +910,9 @@ const Chatbox: FC = () => {
           />
         )}
 
-        {/* Outgoing Ring — replaces the chat stream until someone picks up */}
-        {isPrivateRoom && isInCall && !callMinimized ? (
-          <div className="flex-1 min-h-0 overflow-hidden relative">
+        {/* Active Video Call Mesh — remains alive in background when minimized so WebRTC and audio are not destroyed */}
+        {isPrivateRoom && isInCall && (
+          <div className={`flex-1 min-h-0 overflow-hidden relative ${callMinimized ? 'hidden' : ''}`}>
             <VideoCall
               roomId={currentRoom}
               isPrivateRoom={isPrivateRoom}
@@ -920,7 +920,9 @@ const Chatbox: FC = () => {
               onClose={handleLeaveCall}
             />
           </div>
-        ) : isPrivateRoom && callPhase === 'ringing-out' ? (
+        )}
+
+        {isPrivateRoom && callPhase === 'ringing-out' ? (
           <div className="flex-1 min-h-0 overflow-hidden relative">
             <CallRingOverlay
               mode="outgoing"
@@ -932,7 +934,7 @@ const Chatbox: FC = () => {
               onDecline={handleCancelRing}
             />
           </div>
-        ) : (
+        ) : (!isInCall || callMinimized) ? (
           <>
             {/* Messages Stream Container */}
             <div
@@ -1051,7 +1053,7 @@ const Chatbox: FC = () => {
               </div>
             </footer>
           </>
-        )}
+        ) : null}
       </div>
 
       {/* MLS Debugger Inspector Side Panel (Only in Private Rooms) */}

@@ -8,6 +8,8 @@ interface Props {
   density?: TileDensity;
   isSpotlight?: boolean;
   isThumbnail?: boolean;
+  /** Whether the LOCAL user is deafened — controls muting of remote audio elements */
+  localIsDeafened?: boolean;
   onSpotlight: () => void;
   onVolumeClick: (id: string) => void;
   onKick: (id: string) => void;
@@ -23,41 +25,10 @@ const avatarSize: Record<TileDensity, string> = {
 
 export const ParticipantTile = React.memo<Props>(({
   participant, density = 'medium', isSpotlight, isThumbnail,
-  onSpotlight, onVolumeClick, onKick, localVideoRef,
+  onSpotlight, onVolumeClick, onKick,
 }) => {
   const [hover, setHover] = useState(false);
   const [tapMenu, setTapMenu] = useState(false);
-
-  const remoteVideoRef = React.useRef<HTMLVideoElement | null>(null);
-  const remoteAudioRef = React.useRef<HTMLAudioElement | null>(null);
-
-  // Bind remote stream to audio/video elements
-  React.useEffect(() => {
-    if (!participant.isLocal && participant.stream) {
-      if (remoteVideoRef.current && remoteVideoRef.current.srcObject !== participant.stream) {
-        remoteVideoRef.current.srcObject = participant.stream;
-      }
-      if (remoteAudioRef.current && remoteAudioRef.current.srcObject !== participant.stream) {
-        remoteAudioRef.current.srcObject = participant.stream;
-      }
-    }
-  }, [participant.isLocal, participant.stream, participant.isVideoOn]);
-
-  // Handle participant volume and deafen states
-  React.useEffect(() => {
-    if (!participant.isLocal) {
-      const vol = Math.max(0, Math.min(2, (participant.volume ?? 100) / 100));
-      const muted = Boolean(participant.isDeafened);
-      if (remoteVideoRef.current) {
-        remoteVideoRef.current.volume = Math.min(1, vol);
-        remoteVideoRef.current.muted = muted;
-      }
-      if (remoteAudioRef.current) {
-        remoteAudioRef.current.volume = Math.min(1, vol);
-        remoteAudioRef.current.muted = muted;
-      }
-    }
-  }, [participant.isLocal, participant.volume, participant.isDeafened]);
 
   const speaking = participant.isSpeaking && !participant.isMuted;
   const effective: TileDensity = isSpotlight ? 'large' : isThumbnail ? 'tiny' : density;
@@ -74,6 +45,12 @@ export const ParticipantTile = React.memo<Props>(({
     if (compact || 'ontouchstart' in window) setTapMenu(v => !v);
   };
 
+  const hasVideoTrack = Boolean(
+    participant.stream &&
+    participant.stream.getVideoTracks().length > 0 &&
+    participant.stream.getVideoTracks().some(t => t.readyState === 'live')
+  );
+
   return (
     <div
       onMouseEnter={() => setHover(true)}
@@ -83,41 +60,45 @@ export const ParticipantTile = React.memo<Props>(({
       className={`relative w-full h-full bg-[#181818] overflow-hidden flex items-center justify-center transition-all duration-200 ${border} ${!isThumbnail ? 'cursor-pointer' : ''}`}
     >
       {participant.isVideoOn ? (
-        <div className="w-full h-full bg-[#121212] relative">
-          {participant.isLocal ? (
-            <video ref={localVideoRef} autoPlay playsInline muted className="w-full h-full object-cover -scale-x-100" />
-          ) : (
-            <div className="w-full h-full relative">
-              <video
-                ref={remoteVideoRef}
-                autoPlay
-                playsInline
-                className="w-full h-full object-cover"
-              />
-              {!participant.stream && (
-                <div className="absolute inset-0 bg-gradient-to-br from-[#1c1c1c] to-[#242424] flex items-center justify-center">
-                  <div className="flex flex-col items-center gap-1.5">
-                    <div className={`${avatarSize[effective]} border border-[#333333] bg-[#272727] flex items-center justify-center shadow-lg font-mono font-bold text-white`}>
-                      {participant.name.slice(0, 2).toUpperCase()}
-                    </div>
-                    {!tiny && <span className="font-mono text-[9px] text-zinc-500 uppercase tracking-widest hidden sm:inline">CONNECTING // STREAM</span>}
-                  </div>
+        <div className="w-full h-full bg-[#121212] relative flex items-center justify-center overflow-hidden">
+          {participant.stream ? (
+            <video
+              ref={(node) => {
+                if (node) {
+                  const targetStream = participant.stream || null;
+                  if (node.srcObject !== targetStream) {
+                    node.srcObject = targetStream;
+                  }
+                  node.play().catch(() => {});
+                }
+              }}
+              autoPlay
+              playsInline
+              muted
+              className={`w-full h-full object-cover ${participant.isLocal ? '-scale-x-100' : ''}`}
+            />
+          ) : null}
+
+          {(!participant.stream || !hasVideoTrack) && (
+            <div className="absolute inset-0 bg-gradient-to-br from-[#1c1c1c] to-[#242424] flex items-center justify-center">
+              <div className="flex flex-col items-center gap-1.5">
+                <div className={`${avatarSize[effective]} border border-[#333333] bg-[#272727] flex items-center justify-center shadow-lg font-mono font-bold text-white`}>
+                  {participant.name.slice(0, 2).toUpperCase()}
                 </div>
-              )}
+                {!tiny && <span className="font-mono text-[9px] text-zinc-500 uppercase tracking-widest hidden sm:inline">INITIALIZING // CAMERA</span>}
+              </div>
             </div>
           )}
         </div>
       ) : (
         <div className="w-full h-full flex flex-col items-center justify-center bg-[#181818] p-2 sm:p-3">
-          {/* Background audio playback for voice when video is off */}
-          {!participant.isLocal && <audio ref={remoteAudioRef} autoPlay playsInline />}
           <div className={`border bg-[#202020] flex items-center justify-center font-mono font-bold text-white shadow-xl shrink-0 ${avatarSize[effective]} ${isSpotlight && !tiny && !compact ? 'sm:w-24 sm:h-24 sm:text-2xl w-20 h-20 text-xl' : ''} ${speaking ? 'border-[#10b981]' : 'border-[#333333]'}`}>
             {participant.name.slice(0, 2).toUpperCase()}
           </div>
           {!tiny && !isThumbnail && (
             <div className={`mt-2 flex flex-col items-center gap-0.5 ${compact ? 'hidden sm:flex' : ''}`}>
               <span className="font-mono text-[9px] text-[#ff3535] font-bold uppercase tracking-widest truncate max-w-[14ch]">{participant.role || 'PEER_NODE'}</span>
-              {!compact && <span className="font-mono text-[10px] text-zinc-500 uppercase">{speaking ? 'TRANSMITTING VOICE' : 'CARRIER STANDBY'}</span>}
+              {!compact && <span className="font-mono text-[10px] text-zinc-500 uppercase">{speaking ? 'TRANSMITTING VOICE' : 'STANDBY'}</span>}
             </div>
           )}
         </div>

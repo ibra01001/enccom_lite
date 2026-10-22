@@ -7,19 +7,18 @@ interface GridProps {
   columns: number; gap: number; dockH: number; tileDensity: TileDensity;
   totalPages: number; currentPage: number; visibleCount: number; tileW: number;
   onSpotlight: (id: string) => void; onVolume: (id: string) => void; onKick: (id: string) => void;
-  localRef: React.RefObject<HTMLVideoElement | null>;
   onPage: (n: number) => void;
 }
 
 export const CallGrid: React.FC<GridProps> = ({
   participants, columns, gap, dockH, tileDensity, totalPages, currentPage, visibleCount, tileW,
-  onSpotlight, onVolume, onKick, localRef, onPage,
+  onSpotlight, onVolume, onKick, onPage,
 }) => (
   <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden p-2 sm:p-3 md:p-4 flex flex-col items-center scrollbar-thin">
     <div className="w-full grid auto-rows-fr content-start" style={{ gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))`, gap: `${gap}px`, maxWidth: participants.length <= 2 ? '960px' : participants.length <= 4 ? '1100px' : '100%', paddingBottom: `${dockH}px` }}>
       {participants.map(p => (
         <div key={p.id} className="w-full aspect-video overflow-hidden rounded">
-          <ParticipantTile participant={p} density={tileDensity} onSpotlight={() => onSpotlight(p.id)} onVolumeClick={onVolume} onKick={onKick} localVideoRef={p.isLocal ? localRef : undefined} />
+          <ParticipantTile participant={p} density={tileDensity} onSpotlight={() => onSpotlight(p.id)} onVolumeClick={onVolume} onKick={onKick} />
         </div>
       ))}
     </div>
@@ -44,13 +43,13 @@ export const CallGrid: React.FC<GridProps> = ({
 interface SpotlightProps {
   participants: CallParticipant[]; spotlight: CallParticipant;
   spotlightId: string | null; isScreenSharing: boolean;
-  screenRef: React.RefObject<HTMLVideoElement | null>; localRef: React.RefObject<HTMLVideoElement | null>;
+  screenRef: React.RefObject<HTMLVideoElement | null>;
   screenStreamRef: React.RefObject<MediaStream | null>;
   onSpotlight: (id: string) => void; onVolume: (id: string) => void; onKick: (id: string) => void;
 }
 
 export const CallSpotlight: React.FC<SpotlightProps> = ({
-  participants, spotlight, spotlightId, isScreenSharing, screenRef, localRef, screenStreamRef, onSpotlight, onVolume, onKick,
+  participants, spotlight, spotlightId, isScreenSharing, screenRef, screenStreamRef, onSpotlight, onVolume, onKick,
 }) => {
   const others = participants.filter(p => spotlightId !== 'local-screenshare' && p.id !== spotlightId);
   return (
@@ -76,7 +75,7 @@ export const CallSpotlight: React.FC<SpotlightProps> = ({
             )}
           </div>
         ) : (
-          <ParticipantTile participant={spotlight} density="large" isSpotlight onSpotlight={() => {}} onVolumeClick={onVolume} onKick={onKick} localVideoRef={spotlight.isLocal ? localRef : undefined} />
+          <ParticipantTile participant={spotlight} density="large" isSpotlight onSpotlight={() => {}} onVolumeClick={onVolume} onKick={onKick} />
         )}
       </div>
 
@@ -86,7 +85,7 @@ export const CallSpotlight: React.FC<SpotlightProps> = ({
           const active = p.id === spotlightId;
           return (
             <button key={p.id} type="button" onClick={() => onSpotlight(p.id)} className={`h-full aspect-video w-[160px] sm:w-[190px] shrink-0 snap-start rounded overflow-hidden border-2 cursor-pointer ${active ? 'border-[#ff3535] shadow-lg' : 'border-transparent hover:border-zinc-500'}`}>
-              <ParticipantTile participant={p} density="tiny" isThumbnail onSpotlight={() => onSpotlight(p.id)} onVolumeClick={onVolume} onKick={onKick} localVideoRef={p.isLocal ? localRef : undefined} />
+              <ParticipantTile participant={p} density="tiny" isThumbnail onSpotlight={() => onSpotlight(p.id)} onVolumeClick={onVolume} onKick={onKick} />
             </button>
           );
         })}
@@ -97,7 +96,7 @@ export const CallSpotlight: React.FC<SpotlightProps> = ({
           const active = p.id === spotlightId;
           return (
             <button key={p.id} type="button" onClick={() => onSpotlight(p.id)} className={`w-full aspect-video shrink-0 rounded overflow-hidden border-2 text-left cursor-pointer ${active ? 'border-[#ff3535] shadow-lg' : 'border-transparent hover:border-zinc-600'}`}>
-              <ParticipantTile participant={p} density="small" isThumbnail onSpotlight={() => onSpotlight(p.id)} onVolumeClick={onVolume} onKick={onKick} localVideoRef={p.isLocal ? localRef : undefined} />
+              <ParticipantTile participant={p} density="small" isThumbnail onSpotlight={() => onSpotlight(p.id)} onVolumeClick={onVolume} onKick={onKick} />
             </button>
           );
         })}

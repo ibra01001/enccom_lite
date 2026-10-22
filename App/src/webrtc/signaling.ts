@@ -4,6 +4,29 @@ import type { Socket } from 'socket.io-client';
 export interface CallUserJoinedPayload {
   peerId: string;
   room: string;
+  isMuted?: boolean;
+  isVideoOn?: boolean;
+}
+
+export interface CallUserStatePayload {
+  peerId: string;
+  room?: string;
+  isMuted?: boolean;
+  isVideoOn?: boolean;
+  isDeafened?: boolean;
+  isScreenSharing?: boolean;
+}
+
+export interface CallReactionPayload {
+  sender: string;
+  emoji: string;
+  room?: string;
+}
+
+export interface CallKickedPayload {
+  target: string;
+  by: string;
+  room?: string;
 }
 
 export interface CallOfferPayload {
@@ -67,6 +90,9 @@ export interface SignalingHandlers {
   onIce: (payload: CallIcePayload) => void;
   onUserLeft: (payload: CallUserLeftPayload) => void;
   onSessionSync?: (payload: CallSessionSyncPayload) => void;
+  onUserState?: (payload: CallUserStatePayload) => void;
+  onReaction?: (payload: CallReactionPayload) => void;
+  onKicked?: (payload: CallKickedPayload) => void;
 }
 
 /**
@@ -79,8 +105,33 @@ export function emitGetCallStatus(socket: Socket, room: string) {
 /**
  * Emit call join request to backend room.
  */
-export function emitCallJoin(socket: Socket, room: string) {
-  socket.emit('call_join', { room });
+export function emitCallJoin(socket: Socket, room: string, isMuted = false, isVideoOn = false) {
+  socket.emit('call_join', { room, isMuted, isVideoOn });
+}
+
+/**
+ * Emit call media / deafen state update to backend room.
+ */
+export function emitCallUserState(
+  socket: Socket,
+  room: string,
+  state: { isMuted?: boolean; isVideoOn?: boolean; isDeafened?: boolean; isScreenSharing?: boolean }
+) {
+  socket.emit('call_user_state', { room, ...state });
+}
+
+/**
+ * Emit floating emoji reaction to call participants.
+ */
+export function emitCallReaction(socket: Socket, room: string, emoji: string) {
+  socket.emit('call_reaction', { room, emoji });
+}
+
+/**
+ * Emit call kick request (room owner kicking a participant).
+ */
+export function emitCallKick(socket: Socket, room: string, target: string) {
+  socket.emit('call_kick', { room, target });
 }
 
 /**
@@ -142,10 +193,6 @@ export function emitCallRingDecline(socket: Socket, room: string) {
 /**
  * Subscribe to all call signaling events from the server.
  * Returns an unsubscribe cleanup callback.
- *
- * NOTE: ring events are deliberately NOT wired here — this listener only runs
- * while inside a call, and a ring must be receivable before joining one.
- * Subscribe to call_incoming / call_ring_* at the room level instead.
  */
 export function setupSignalingListeners(socket: Socket, handlers: SignalingHandlers): () => void {
   socket.on('call_user_joined', handlers.onUserJoined);
@@ -155,6 +202,9 @@ export function setupSignalingListeners(socket: Socket, handlers: SignalingHandl
   socket.on('call_user_left', handlers.onUserLeft);
   socket.on('peer_left', handlers.onUserLeft);
   if (handlers.onSessionSync) socket.on('call_session_sync', handlers.onSessionSync);
+  if (handlers.onUserState) socket.on('call_user_state', handlers.onUserState);
+  if (handlers.onReaction) socket.on('call_reaction', handlers.onReaction);
+  if (handlers.onKicked) socket.on('call_kicked', handlers.onKicked);
 
   return () => {
     socket.off('call_user_joined', handlers.onUserJoined);
@@ -164,5 +214,8 @@ export function setupSignalingListeners(socket: Socket, handlers: SignalingHandl
     socket.off('call_user_left', handlers.onUserLeft);
     socket.off('peer_left', handlers.onUserLeft);
     if (handlers.onSessionSync) socket.off('call_session_sync', handlers.onSessionSync);
+    if (handlers.onUserState) socket.off('call_user_state', handlers.onUserState);
+    if (handlers.onReaction) socket.off('call_reaction', handlers.onReaction);
+    if (handlers.onKicked) socket.off('call_kicked', handlers.onKicked);
   };
 }

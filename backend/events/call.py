@@ -191,7 +191,12 @@ def handle_call_join(data):
     r.delete(_ring_key(room))
 
     # Notify existing peers in the call mesh
-    emit('call_user_joined', {'peerId': user_id, 'room': room}, to=call_room, include_self=False)
+    emit('call_user_joined', {
+        'peerId': user_id,
+        'room': room,
+        'isMuted': bool(data.get('isMuted')),
+        'isVideoOn': bool(data.get('isVideoOn'))
+    }, to=call_room, include_self=False)
 
     # Sync current participants to joining user
     emit('call_session_sync', {
@@ -288,4 +293,73 @@ def handle_call_ice(data):
         'sender': sender_id,
         'candidate': data.get('candidate')
     }, to=f"user:{data['target']}")
+
+
+@socketio.on('call_user_state')
+def handle_call_user_state(data):
+    """
+    Broadcast participant state changes (mic mute, camera on/off, deafen, screenshare)
+    to all active participants in the call room.
+    Preserves existing states by only transmitting fields explicitly provided.
+    """
+    if not isinstance(data, dict):
+        return
+    room = data.get('room')
+    if not room:
+        return
+
+    sender_id = get_current_user_id()
+    payload = {
+        'peerId': sender_id,
+        'room': room,
+    }
+    for field in ('isMuted', 'isVideoOn', 'isDeafened', 'isScreenSharing'):
+        if field in data and data[field] is not None:
+            payload[field] = bool(data[field])
+
+    emit('call_user_state', payload, to=f"call:{room}", include_self=False)
+
+
+@socketio.on('call_reaction')
+def handle_call_reaction(data):
+    """
+    Broadcast floating emoji reaction to all participants in the call.
+    """
+    if not isinstance(data, dict):
+        return
+    room = data.get('room')
+    emoji = data.get('emoji')
+    if not room or not emoji:
+        return
+
+    sender_id = get_current_user_id()
+    emit('call_reaction', {
+        'sender': sender_id,
+        'peerId': sender_id,
+        'room': room,
+        'emoji': emoji
+    }, to=f"call:{room}", include_self=False)
+
+
+@socketio.on('call_kick')
+def handle_call_kick(data):
+    """
+    Disconnect a participant from the call (if caller is room owner).
+    """
+    if not isinstance(data, dict):
+        return
+    room = data.get('room')
+    target_id = data.get('target')
+    if not room or not target_id:
+        return
+
+    user_id = get_current_user_id()
+    room_meta = room_service.get_room_metadata(room)
+    if room_meta and room_meta.get('owner') == user_id:
+        emit('call_kicked', {
+            'room': room,
+            'target': target_id,
+            'peerId': target_id,
+            'by': user_id
+        }, to=f"call:{room}", include_self=True)
 

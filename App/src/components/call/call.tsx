@@ -1,9 +1,9 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import type { CallParticipant, CallLayoutMode, FloatingReaction } from './callTypes';
+import type { CallParticipant, CallLayoutMode } from './callTypes';
 import { useAdaptiveCallLayout, useIsMobile } from './useAdaptiveCallLayout';
 import { CallGrid, CallSpotlight, ReactionsOverlay } from './CallStage';
 import { CallDock } from './CallDock';
-import { VolumeModal } from './CallModals';
+import { VolumeModal, CallSettingsModal } from './CallModals';
 import type { TileDensity } from './ParticipantTile';
 import { useSocket } from '../../context/SocketContext';
 import { useWebRTC } from '../../webrtc/peerConnection';
@@ -15,16 +15,82 @@ interface Props {
   onClose?: () => void;
 }
 
-export const VideoCall: React.FC<Props> = ({ roomId, isPrivateRoom = false, myId = 'local-user', onClose }) => {
+/**
+ * Dedicated, centralized audio playback for all remote participants.
+ * Decoupled from visual tiles so that pagination, layout switching, or thumbnail rendering
+ * NEVER cuts off audio or causes duplicate echoing audio streams.
+ */
+const CallAudioElement: React.FC<{
+  stream: MediaStream;
+  volume: number;
+  muted: boolean;
+}> = ({ stream, volume, muted }) => {
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  useEffect(() => {
+    if (audioRef.current && audioRef.current.srcObject !== stream) {
+      audioRef.current.srcObject = stream;
+      audioRef.current.play().catch(() => {});
+    }
+  }, [stream]);
+
+  useEffect(() => {
+    if (audioRef.current) {
+      audioRef.current.volume = Math.max(0, Math.min(1, volume / 100));
+      audioRef.current.muted = muted;
+    }
+  }, [volume, muted]);
+
+  return (
+    <audio
+      ref={(el) => {
+        audioRef.current = el;
+        if (el && el.srcObject !== stream) {
+          el.srcObject = stream;
+          el.play().catch(() => {});
+        }
+      }}
+      autoPlay
+      playsInline
+      style={{ display: 'none' }}
+    />
+  );
+};
+
+const CallAudioStreams: React.FC<{
+  participants: CallParticipant[];
+  isDeafened: boolean;
+}> = ({ participants, isDeafened }) => {
+  return (
+    <div style={{ display: 'none' }} aria-hidden>
+      {participants
+        .filter((p) => !p.isLocal && p.stream && p.stream.getAudioTracks().length > 0)
+        .map((p) => (
+          <CallAudioElement
+            key={p.id}
+            stream={p.stream!}
+            volume={p.volume ?? 100}
+            muted={isDeafened}
+          />
+        ))}
+    </div>
+  );
+};
+
+export const VideoCall: React.FC<Props> = ({
+  roomId,
+  isPrivateRoom = false,
+  myId = 'local-user',
+  onClose,
+}) => {
   const { socket } = useSocket();
   const [layout, setLayout] = useState<CallLayoutMode>('grid');
   const [spotlightId, setSpotlightId] = useState<string | null>(null);
   const [showReactions, setShowReactions] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
   const [volumeFor, setVolumeFor] = useState<string | null>(null);
-  const [reactions, setReactions] = useState<FloatingReaction[]>([]);
   const [page, setPage] = useState(0);
 
-  const localRef = useRef<HTMLVideoElement | null>(null);
   const screenRef = useRef<HTMLVideoElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const dockRef = useRef<HTMLElement | null>(null);
@@ -40,11 +106,14 @@ export const VideoCall: React.FC<Props> = ({ roomId, isPrivateRoom = false, myId
     isVideoOn,
     isScreenSharing,
     isDeafened,
+    reactions,
     toggleMic,
     toggleCam,
     toggleScreenShare,
     toggleDeafen,
-    removePeer,
+    switchMediaDevice,
+    triggerReaction,
+    kickPeer,
   } = useWebRTC({
     roomId,
     myId,
@@ -53,13 +122,6 @@ export const VideoCall: React.FC<Props> = ({ roomId, isPrivateRoom = false, myId
 
   const screenStreamRef = useRef<MediaStream | null>(null);
   screenStreamRef.current = screenStream;
-
-  // Bind local webcam stream to video element
-  useEffect(() => {
-    if (localRef.current && localStream) {
-      localRef.current.srcObject = localStream;
-    }
-  }, [localStream, isVideoOn]);
 
   // Bind screen stream to video element
   useEffect(() => {
@@ -88,32 +150,33 @@ export const VideoCall: React.FC<Props> = ({ roomId, isPrivateRoom = false, myId
     }
   };
 
-  const triggerReaction = useCallback((emoji: string) => {
-    const r: FloatingReaction = {
-      id: Math.random().toString(),
-      emoji,
-      senderName: 'YOU',
-      x: Math.floor(20 + Math.random() * 60),
-    };
-    setReactions((p) => [...p, r]);
-    setShowReactions(false);
-    setTimeout(() => setReactions((p) => p.filter((x) => x.id !== r.id)), 2800);
-  }, []);
+  const handleReaction = useCallback(
+    (emoji: string) => {
+      triggerReaction(emoji);
+      setShowReactions(false);
+    },
+    [triggerReaction]
+  );
 
   const changeVolume = useCallback(
-    (id: string, v: number) => setParticipants((p) => p.map((x) => (x.id === id ? { ...x, volume: v } : x))),
+    (id: string, v: number) =>
+      setParticipants((p) => p.map((x) => (x.id === id ? { ...x, volume: v } : x))),
     [setParticipants]
   );
 
   const gap = isMobile ? 8 : 12;
-  const { columns, totalPages, visibleCount, tileW } = useAdaptiveCallLayout(stageRef, participants.length, {
-    gap,
-    minTileW: isMobile ? 132 : 156,
-    minTileH: isMobile ? 84 : 96,
-    maxTileH: isMobile ? 260 : 360,
-    controlDockReserve: dockH,
-    currentPage: page,
-  });
+  const { columns, totalPages, visibleCount, tileW } = useAdaptiveCallLayout(
+    stageRef,
+    participants.length,
+    {
+      gap,
+      minTileW: isMobile ? 132 : 156,
+      minTileH: isMobile ? 84 : 96,
+      maxTileH: isMobile ? 260 : 360,
+      controlDockReserve: dockH,
+      currentPage: page,
+    }
+  );
 
   const paginated = useMemo(
     () =>
@@ -152,8 +215,12 @@ export const VideoCall: React.FC<Props> = ({ roomId, isPrivateRoom = false, myId
         <div className="w-16 h-16 rounded bg-[#202020] border border-[#ff3535] flex items-center justify-center text-[#ff3535] mb-4 shadow-xl">
           <span className="material-symbols-outlined text-3xl">videocam_off</span>
         </div>
-        <h3 className="text-base font-bold text-white uppercase tracking-wider mb-2">RESTRICTED TRANSMISSION</h3>
-        <p className="text-xs text-zinc-400 max-w-md mb-6">Encrypted streams restricted to private MLS RFC 9420 rooms.</p>
+        <h3 className="text-base font-bold text-white uppercase tracking-wider mb-2">
+          RESTRICTED TRANSMISSION
+        </h3>
+        <p className="text-xs text-zinc-400 max-w-md mb-6">
+          Encrypted streams restricted to private MLS RFC 9420 rooms.
+        </p>
         {onClose && (
           <button
             type="button"
@@ -169,6 +236,9 @@ export const VideoCall: React.FC<Props> = ({ roomId, isPrivateRoom = false, myId
 
   return (
     <div className="relative w-full h-full flex flex-col bg-[#272727] text-[#e5e2e1] select-none overflow-hidden font-['Hanken_Grotesk',sans-serif] ob-grid-bg">
+      {/* Centralized WebRTC Audio Layer: always active, never interrupted by pagination or layout */}
+      <CallAudioStreams participants={participants} isDeafened={isDeafened} />
+
       <main ref={stageRef} className="flex-1 min-h-0 relative flex flex-col overflow-hidden bg-[#272727]">
         <ReactionsOverlay reactions={reactions} />
         {layout === 'spotlight' ? (
@@ -178,11 +248,10 @@ export const VideoCall: React.FC<Props> = ({ roomId, isPrivateRoom = false, myId
             spotlightId={spotlightId}
             isScreenSharing={isScreenSharing}
             screenRef={screenRef}
-            localRef={localRef}
             screenStreamRef={screenStreamRef}
             onSpotlight={setSpotlightId}
             onVolume={setVolumeFor}
-            onKick={removePeer}
+            onKick={kickPeer}
           />
         ) : (
           <CallGrid
@@ -200,8 +269,7 @@ export const VideoCall: React.FC<Props> = ({ roomId, isPrivateRoom = false, myId
               setLayout('spotlight');
             }}
             onVolume={setVolumeFor}
-            onKick={removePeer}
-            localRef={localRef}
+            onKick={kickPeer}
             onPage={setPage}
           />
         )}
@@ -212,6 +280,13 @@ export const VideoCall: React.FC<Props> = ({ roomId, isPrivateRoom = false, myId
         participants={participants}
         onClose={() => setVolumeFor(null)}
         onChange={changeVolume}
+      />
+
+      <CallSettingsModal
+        isOpen={showSettings}
+        onClose={() => setShowSettings(false)}
+        localStream={localStream}
+        onSwitchDevice={switchMediaDevice}
       />
 
       <CallDock
@@ -228,7 +303,8 @@ export const VideoCall: React.FC<Props> = ({ roomId, isPrivateRoom = false, myId
         onToggleDeafen={toggleDeafen}
         onToggleLayout={() => setLayout((m) => (m === 'grid' ? 'spotlight' : 'grid'))}
         onToggleReactions={() => setShowReactions((v) => !v)}
-        onReaction={triggerReaction}
+        onReaction={handleReaction}
+        onToggleSettings={() => setShowSettings(true)}
         onClose={onClose}
       />
     </div>
@@ -236,4 +312,3 @@ export const VideoCall: React.FC<Props> = ({ roomId, isPrivateRoom = false, myId
 };
 
 export default VideoCall;
-

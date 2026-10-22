@@ -6,7 +6,9 @@ interface Props {
   layoutMode: CallLayoutMode; showReactions: boolean;
   onToggleMic: () => void; onToggleCam: () => void; onToggleShare: () => void; onToggleDeafen: () => void;
   onToggleLayout: () => void;
-  onToggleReactions: () => void; onReaction: (e: string) => void; onClose?: () => void;
+  onToggleReactions: () => void; onReaction: (e: string) => void;
+  onToggleSettings: () => void;
+  onClose?: () => void;
 }
 
 // unified square buttons - same size everywhere (sharp like HowItWorksSteps)
@@ -17,7 +19,7 @@ const activeGreen = 'bg-[#10b981]/15 text-[#10b981] border-[#10b981]';
 
 export const CallDock = React.forwardRef<HTMLElement, Props>(({
   isMicMuted, isVideoOn, isScreenSharing, isDeafened, layoutMode, showReactions,
-  onToggleMic, onToggleCam, onToggleShare, onToggleDeafen, onToggleLayout, onToggleReactions, onReaction, onClose,
+  onToggleMic, onToggleCam, onToggleShare, onToggleDeafen, onToggleLayout, onToggleReactions, onReaction, onToggleSettings, onClose,
 }, ref) => (
   <footer
     ref={ref}
@@ -47,6 +49,10 @@ export const CallDock = React.forwardRef<HTMLElement, Props>(({
 
     <button type="button" onClick={onToggleLayout} className={`${base} ${idle}`} title={layoutMode === 'grid' ? 'Focus view' : 'Grid view'}>
       <span className="material-symbols-outlined text-[20px] leading-none">{layoutMode === 'grid' ? 'view_carousel' : 'grid_view'}</span>
+    </button>
+
+    <button type="button" onClick={onToggleSettings} className={`${base} ${idle}`} title="Hardware & Voice Settings">
+      <span className="material-symbols-outlined text-[20px] leading-none">settings</span>
     </button>
 
     <div className="relative shrink-0">
