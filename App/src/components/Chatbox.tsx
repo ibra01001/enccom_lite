@@ -6,6 +6,7 @@ import MlsDebugger from './MlsDebugger';
 import { getCachedMessages } from '../utils/indexedDb';
 import VideoCall from './call/call';
 import CallRingOverlay from './call/CallRingOverlay';
+import JoinRequestOverlay from './call/JoinRequestOverlay';
 import { startRingtone, stopRingtone } from '../webrtc/ringtone';
 import {
   emitCallRing,
@@ -25,6 +26,7 @@ import type {
   Message,
   HistoryPayload,
   JoinErrorPayload,
+  RoomJoinRequestPayload,
 } from '../types/chat';
 
 interface RoomMeta {
@@ -51,10 +53,7 @@ interface ActiveCallState {
 const RING_TIMEOUT_S = 35;
 
 const Chatbox: FC = () => {
-  const [currentRoom, setCurrentRoom] = useState<string>(() => {
-    const params = new URLSearchParams(window.location.search);
-    return params.get('room') || 'public';
-  });
+  const [currentRoom, setCurrentRoom] = useState<string>('public');
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState<string>('');
   const [joinError, setJoinError] = useState<string | null>(null);
@@ -67,6 +66,7 @@ const Chatbox: FC = () => {
   const [ringSecondsLeft, setRingSecondsLeft] = useState<number>(RING_TIMEOUT_S);
   const [callMinimized, setCallMinimized] = useState<boolean>(false);
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(false);
+  const [pendingJoinRequests, setPendingJoinRequests] = useState<RoomJoinRequestPayload[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
   const touchStartRef = useRef<{ x: number; y: number } | null>(null);
   const swipeContainerRef = useRef<HTMLDivElement>(null);
@@ -240,14 +240,13 @@ const Chatbox: FC = () => {
     };
 
     const handleJoinError = (data: JoinErrorPayload) => {
-      // The invite link points to a deleted or non-existent room
       setJoinError(data?.message || 'Room not found.');
       setCurrentRoom('public');
       socket.emit('join_room', { room: 'public' });
     };
 
     const handleInitialHistory = (data: HistoryPayload) => {
-      // After successfully joining a private room via link, refresh the sidebar
+      // After successfully joining a private room, refresh the sidebar
       const targetRoom = Array.isArray(data) ? 'public' : data?.room || 'public';
       if (targetRoom !== 'public') {
         socket.emit('get_my_rooms');
@@ -330,12 +329,25 @@ const Chatbox: FC = () => {
       }
     };
 
+    const handleRoomJoinRequest = (data: RoomJoinRequestPayload) => {
+      setPendingJoinRequests((prev) => {
+        if (prev.some((r) => r.requestId === data.requestId)) return prev;
+        return [...prev, data];
+      });
+    };
+
+    const handleRoomJoinRequestCancelled = (data: { requestId: string }) => {
+      setPendingJoinRequests((prev) => prev.filter((r) => r.requestId !== data.requestId));
+    };
+
     socket.on('initial history', handleInitialHistory);
     socket.on('chat message', handleMessage);
     socket.on('join_error', handleJoinError);
     socket.on('room_joined', handleRoomJoined);
     socket.on('peer_joined', handlePeerJoinedRoom);
     socket.on('peer_left', handlePeerLeftRoom);
+    socket.on('room_join_request', handleRoomJoinRequest);
+    socket.on('room_join_request_cancelled', handleRoomJoinRequestCancelled);
 
     return () => {
       socket.off('connect', joinCurrentRoom);
@@ -345,6 +357,8 @@ const Chatbox: FC = () => {
       socket.off('room_joined', handleRoomJoined);
       socket.off('peer_joined', handlePeerJoinedRoom);
       socket.off('peer_left', handlePeerLeftRoom);
+      socket.off('room_join_request', handleRoomJoinRequest);
+      socket.off('room_join_request_cancelled', handleRoomJoinRequestCancelled);
     };
   }, [socket, currentRoom, decryptMessage, myId, hasGroup, restoreGroupAsOwner, requestWelcome, recreateGroupAsOwner]);
 
@@ -420,6 +434,32 @@ const Chatbox: FC = () => {
     setRingSecondsLeft(RING_TIMEOUT_S);
     emitCallRingCancel(socket, currentRoom);
   }, [socket, currentRoom, abortRing]);
+
+  const handleAcceptJoinRequest = useCallback(
+    (req: RoomJoinRequestPayload) => {
+      if (!socket) return;
+      socket.emit('respond_join_request', {
+        requestId: req.requestId,
+        room: req.room,
+        decision: 'accept',
+      });
+      setPendingJoinRequests((prev) => prev.filter((r) => r.requestId !== req.requestId));
+    },
+    [socket]
+  );
+
+  const handleDeclineJoinRequest = useCallback(
+    (req: RoomJoinRequestPayload) => {
+      if (!socket) return;
+      socket.emit('respond_join_request', {
+        requestId: req.requestId,
+        room: req.room,
+        decision: 'reject',
+      });
+      setPendingJoinRequests((prev) => prev.filter((r) => r.requestId !== req.requestId));
+    },
+    [socket]
+  );
 
   const handleLeaveCall = useCallback(() => {
     abortRing();
@@ -847,6 +887,15 @@ const Chatbox: FC = () => {
               </button>
             </div>
           </div>
+        )}
+
+        {/* Incoming Knock Request for Room Owner */}
+        {pendingJoinRequests.length > 0 && (
+          <JoinRequestOverlay
+            request={pendingJoinRequests[0]}
+            onAccept={handleAcceptJoinRequest}
+            onDecline={handleDeclineJoinRequest}
+          />
         )}
 
         {/* Incoming Ring — takes over the screen like a Discord group call */}

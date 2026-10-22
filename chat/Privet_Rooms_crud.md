@@ -93,11 +93,30 @@ Deleting a private room and removing members:
 
 ---
 
+### 5. Join via 12-Character Code & Owner Approval (Knock)
+To prevent unauthorized room joins and link leakage:
+
+* **12-Character Code**:
+  * Upon room creation, an unguessable 12-character alphanumeric code is generated (e.g. `K9X2-M4P7-Q1J8`) and mapped in Redis (`chat:join_code:<CODE>`).
+  * Instead of sharing plain URLs with room IDs, the owner shares this 12-character code.
+* **Knock Flow**:
+  * Guest pastes the code and emits `request_join_room`.
+  * Guest enters pending state (`join_request_pending`).
+  * Room owner receives `room_join_request` with the requester's ID and room name.
+* **Owner Decision**:
+  * Owner emits `respond_join_request` with decision `'accept'` or `'reject'`.
+  * If accepted: guest is added to `room:<room_id>:authorized_members` and receives `join_request_accepted`, allowing them to safely join the room and enter the MLS group.
+  * If rejected: guest receives `join_request_rejected`.
+
+---
+
 ## Summary Matrix
 
 | Operation | Socket Event | Scope | Redis Action |
 |---|---|---|---|
-| Create | `create_room` | Creator only | Set `chat:room:<room_id>` hash |
+| Create | `create_room` | Creator only | Set `chat:room:<room_id>` hash + `chat:join_code:<code>` |
 | Read | `get_my_rooms` | User only | Query `user:<user_id>:rooms` |
+| Request Join | `request_join_room` | Guest -> Owner | Set `room:<room_id>:pending_requests` |
+| Approve/Reject | `respond_join_request` | Owner -> Guest | Add to `authorized_members` or delete request |
 | Update | `update_room` | Room Members | HSET `chat:room:<room_id>` `name` |
-| Delete | `delete_room` | Room Members | DEL `chat:messages:<room_id>` & `chat:room:<room_id>` |
+| Delete | `delete_room` | Room Members | DEL keys & join code index |

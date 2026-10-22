@@ -3,30 +3,53 @@
 import time
 import uuid
 import json
+import secrets
 from extensions import r
 from config import TTL_SECONDS
 
+JOIN_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # 32 chars: uppercase & digits, omitting ambiguous 0/O and 1/I
+
+def generate_join_code(length=12):
+    """Generate unguessable 12-character alphanumeric code."""
+    return "".join(secrets.choice(JOIN_CODE_ALPHABET) for _ in range(length))
+
+def normalize_join_code(code):
+    """Normalize user input: trim, remove dashes/spaces, uppercase."""
+    if not code:
+        return ""
+    return str(code).replace("-", "").replace(" ", "").strip().upper()
+
 def create_room(user_id, raw_name=None):
-    """Create a new room with MLS metadata and initialize its history."""
+    """Create a new room with MLS metadata, 12-char join code, and initialize its history."""
     room_id = uuid.uuid4().hex[:8]
     room_name = f"room_{room_id}"
     display_name = raw_name.strip()[:64] if raw_name and raw_name.strip() else f"Private Room #{room_id[:4]}"
 
+    join_code = generate_join_code(12)
+    while r.exists(f"chat:join_code:{join_code}"):
+        join_code = generate_join_code(12)
+
     pipe = r.pipeline()
-    # 1. Room metadata with MLS binding
+    # 1. Room metadata with MLS binding & join code
     pipe.hset(f"chat:room:{room_name}", mapping={
         "name": display_name,
         "owner": user_id,
         "created_at": time.time(),
-        "mls_enabled": "1"
+        "mls_enabled": "1",
+        "join_code": join_code
     })
     pipe.expire(f"chat:room:{room_name}", TTL_SECONDS)
-    # 2. Add room to creator's personal room set
+    # 2. Reverse index for join code
+    pipe.set(f"chat:join_code:{join_code}", room_name, ex=TTL_SECONDS)
+    # 3. Creator is authorized member
+    pipe.sadd(f"room:{room_name}:authorized_members", user_id)
+    pipe.expire(f"room:{room_name}:authorized_members", TTL_SECONDS)
+    # 4. Add room to creator's personal room set
     pipe.sadd(f"user:{user_id}:rooms", room_name)
     pipe.expire(f"user:{user_id}:rooms", TTL_SECONDS)
-    # 3. Initialize room epoch counter
+    # 5. Initialize room epoch counter
     pipe.set(f"room:{room_name}:epoch", "0", ex=TTL_SECONDS)
-    # 4. Initialize room message history
+    # 6. Initialize room message history
     room_key = f"chat:messages:{room_name}"
     pipe.lpush(room_key, json.dumps({
         "room": room_name,
@@ -37,7 +60,7 @@ def create_room(user_id, raw_name=None):
     pipe.expire(room_key, TTL_SECONDS)
     pipe.execute()
 
-    return room_name, display_name
+    return room_name, display_name, join_code
 
 def get_user_rooms(user_id):
     """Fetch all accessible rooms for user with batch metadata & auto-pruning."""
@@ -63,12 +86,21 @@ def get_user_rooms(user_id):
             if not meta:
                 stale_rooms.append(room_id)
                 continue
+            
+            # Lazily generate join_code for pre-existing legacy rooms
+            join_code = meta.get("join_code")
+            if not join_code:
+                join_code = generate_join_code(12)
+                r.hset(f"chat:room:{room_id}", "join_code", join_code)
+                r.set(f"chat:join_code:{join_code}", room_id, ex=TTL_SECONDS)
+
             parsed_rooms.append({
                 "id": room_id,
                 "name": meta.get("name", room_id),
                 "owner": meta.get("owner"),
                 "mls_enabled": meta.get("mls_enabled") == "1",
-                "created_at": float(meta.get("created_at", 0))
+                "created_at": float(meta.get("created_at", 0)),
+                "join_code": join_code
             })
 
         if stale_rooms:
@@ -106,7 +138,12 @@ def delete_or_leave_room(user_id, room_id):
     is_owner = (room_meta.get("owner") == user_id)
 
     if is_owner:
+        join_code = room_meta.get("join_code")
         pipe = r.pipeline()
+        if join_code:
+            pipe.delete(f"chat:join_code:{join_code}")
+        pipe.delete(f"room:{room_id}:pending_requests")
+        pipe.delete(f"room:{room_id}:authorized_members")
         pipe.delete(f"chat:messages:{room_id}")
         pipe.delete(f"chat:room:{room_id}")
         pipe.delete(f"room:{room_id}:epoch")
@@ -116,8 +153,11 @@ def delete_or_leave_room(user_id, room_id):
         pipe.execute()
         return True, True
     else:
-        r.srem(f"user:{user_id}:rooms", room_id)
-        r.srem(f"room:{room_id}:active_users", user_id)
+        pipe = r.pipeline()
+        pipe.srem(f"user:{user_id}:rooms", room_id)
+        pipe.srem(f"room:{room_id}:active_users", user_id)
+        pipe.srem(f"room:{room_id}:authorized_members", user_id)
+        pipe.execute()
         return False, True
 
 def get_room_metadata(room_id):
@@ -125,6 +165,96 @@ def get_room_metadata(room_id):
     if not room_id or room_id == 'public':
         return {}
     return r.hgetall(f"chat:room:{room_id}")
+
+def get_room_by_join_code(raw_code):
+    """Lookup room by 12-char join code."""
+    clean_code = normalize_join_code(raw_code)
+    if not clean_code or len(clean_code) != 12:
+        return None, None
+    room_name = r.get(f"chat:join_code:{clean_code}")
+    if isinstance(room_name, bytes):
+        room_name = room_name.decode()
+    if not room_name:
+        return None, None
+    meta = get_room_metadata(room_name)
+    if not meta:
+        return None, None
+    return room_name, meta
+
+def is_user_authorized_for_room(user_id, room_name):
+    """Verify if user is the owner or an accepted member of the room."""
+    if not room_name or room_name == 'public':
+        return True
+    meta = get_room_metadata(room_name)
+    if not meta:
+        return False
+    if meta.get("owner") == user_id:
+        return True
+    return bool(r.sismember(f"room:{room_name}:authorized_members", user_id))
+
+def create_join_request(requester_id, room_name):
+    """Create a pending knock request for room owner approval."""
+    request_id = uuid.uuid4().hex[:8]
+    req_data = {
+        "requestId": request_id,
+        "requesterId": requester_id,
+        "room": room_name,
+        "timestamp": time.time()
+    }
+    r.hset(f"room:{room_name}:pending_requests", request_id, json.dumps(req_data))
+    r.expire(f"room:{room_name}:pending_requests", TTL_SECONDS)
+    return request_id
+
+def resolve_join_request(owner_id, room_name, request_id, decision):
+    """
+    Handle owner acceptance or rejection of a join request.
+    Returns: (success: bool, requester_id: str | None)
+    """
+    room_meta = get_room_metadata(room_name)
+    if not room_meta or room_meta.get("owner") != owner_id:
+        return False, None
+    
+    raw_req = r.hget(f"room:{room_name}:pending_requests", request_id)
+    if not raw_req:
+        return False, None
+    if isinstance(raw_req, bytes):
+        raw_req = raw_req.decode()
+    try:
+        req_obj = json.loads(raw_req)
+        requester_id = req_obj.get("requesterId")
+    except Exception:
+        requester_id = None
+
+    r.hdel(f"room:{room_name}:pending_requests", request_id)
+
+    if not requester_id:
+        return False, None
+
+    if decision == 'accept':
+        pipe = r.pipeline()
+        pipe.sadd(f"room:{room_name}:authorized_members", requester_id)
+        pipe.expire(f"room:{room_name}:authorized_members", TTL_SECONDS)
+        pipe.sadd(f"user:{requester_id}:rooms", room_name)
+        pipe.expire(f"user:{requester_id}:rooms", TTL_SECONDS)
+        pipe.execute()
+        return True, requester_id
+    else:
+        return False, requester_id
+
+def cancel_join_request(requester_id, room_name, request_id):
+    """Cancel a pending join request initiated by the requester."""
+    raw_req = r.hget(f"room:{room_name}:pending_requests", request_id)
+    if raw_req:
+        if isinstance(raw_req, bytes):
+            raw_req = raw_req.decode()
+        try:
+            req_obj = json.loads(raw_req)
+            if req_obj.get("requesterId") == requester_id:
+                r.hdel(f"room:{room_name}:pending_requests", request_id)
+                return True
+        except Exception:
+            pass
+    return False
 
 def refresh_room_ttl(room_id, user_id=None):
     """
@@ -141,6 +271,8 @@ def refresh_room_ttl(room_id, user_id=None):
     pipe.expire(f"room:{room_id}:epoch", TTL_SECONDS)
     pipe.expire(f"room:{room_id}:commits", TTL_SECONDS)
     pipe.expire(f"room:{room_id}:active_users", TTL_SECONDS)
+    pipe.expire(f"room:{room_id}:authorized_members", TTL_SECONDS)
+    pipe.expire(f"room:{room_id}:pending_requests", TTL_SECONDS)
     # Caller's membership set (if known)
     if user_id:
         pipe.expire(f"user:{user_id}:rooms", TTL_SECONDS)

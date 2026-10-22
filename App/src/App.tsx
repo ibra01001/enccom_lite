@@ -10,11 +10,11 @@ import Features from './components/Features';
 export default function App() {
   const location = useLocation();
   const params = new URLSearchParams(location.search);
-  const roomFromUrl = params.get('room');
+  const codeFromUrl = params.get('code');
 
   // Only redirect if they are on the root path to prevent infinite loops
-  if (roomFromUrl && location.pathname === '/') {
-    return <Navigate to={`/chatbox?room=${roomFromUrl}`} replace />;
+  if (codeFromUrl && location.pathname === '/') {
+    return <Navigate to={`/chatbox?code=${codeFromUrl}`} replace />;
   }
 
   return (

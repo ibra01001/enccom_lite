@@ -11,13 +11,14 @@ def create_room(data=None):
     user_id = get_current_user_id()
     raw_name = data.get('name') if isinstance(data, dict) else None
     
-    room_name, display_name = room_service.create_room(user_id, raw_name)
+    room_name, display_name, join_code = room_service.create_room(user_id, raw_name)
     flask_join_room(room_name)
 
     emit('room_created', {
         'room': room_name,
         'name': display_name,
-        'owner': user_id
+        'owner': user_id,
+        'joinCode': join_code
     })
     return room_name
 
@@ -69,6 +70,15 @@ def handle_join_room(data):
             emit('join_error', {'room': room, 'message': 'Room not found or has been deleted.'})
             return
 
+        # Security check: verify membership authorization
+        if not room_service.is_user_authorized_for_room(user_id, room):
+            emit('join_error', {
+                'room': room,
+                'message': 'Access denied. You need the room owner to accept your join request.',
+                'requiresApproval': True
+            })
+            return
+
         room_service.join_room_record(user_id, room)
 
     flask_join_room(room)
@@ -106,3 +116,101 @@ def handle_join_room(data):
 
     history = chat_service.get_room_history(room)
     emit('initial history', {'room': room, 'history': history})
+
+@socketio.on('request_join_room')
+def handle_request_join_room(data):
+    """Guest requests to join private room via 12-char alphanumeric code."""
+    if not isinstance(data, dict):
+        return
+    raw_code = data.get('code')
+    user_id = get_current_user_id()
+    
+    room_name, room_meta = room_service.get_room_by_join_code(raw_code)
+    if not room_name or not room_meta:
+        emit('join_code_error', {'message': 'Invalid join code. Room not found.'})
+        return
+    
+    # If already authorized, grant instant entry
+    if room_service.is_user_authorized_for_room(user_id, room_name):
+        emit('join_request_accepted', {
+            'room': room_name,
+            'name': room_meta.get('name', room_name),
+            'alreadyMember': True
+        })
+        return
+    
+    owner_id = room_meta.get('owner')
+    request_id = room_service.create_join_request(user_id, room_name)
+    
+    # Notify requester
+    emit('join_request_pending', {
+        'requestId': request_id,
+        'room': room_name,
+        'name': room_meta.get('name', room_name)
+    })
+    
+    # Targeted notify to room owner
+    emit('room_join_request', {
+        'requestId': request_id,
+        'room': room_name,
+        'roomName': room_meta.get('name', room_name),
+        'requesterId': user_id
+    }, to=f"user:{owner_id}")
+
+@socketio.on('respond_join_request')
+def handle_respond_join_request(data):
+    """Owner accepts or rejects guest's join request."""
+    if not isinstance(data, dict):
+        return
+    request_id = data.get('requestId')
+    room = data.get('room')
+    decision = data.get('decision')
+    owner_id = get_current_user_id()
+    
+    success, requester_id = room_service.resolve_join_request(owner_id, room, request_id, decision)
+    if not requester_id:
+        return
+    
+    room_meta = room_service.get_room_metadata(room)
+    display_name = room_meta.get('name', room) if room_meta else room
+    
+    if decision == 'accept' and success:
+        emit('join_request_accepted', {
+            'room': room,
+            'name': display_name
+        }, to=f"user:{requester_id}")
+        emit('join_request_resolved', {
+            'requestId': request_id,
+            'room': room,
+            'decision': 'accept',
+            'requesterId': requester_id
+        })
+    else:
+        emit('join_request_rejected', {
+            'room': room,
+            'message': f"Request to join '{display_name}' was declined by the owner."
+        }, to=f"user:{requester_id}")
+        emit('join_request_resolved', {
+            'requestId': request_id,
+            'room': room,
+            'decision': 'reject',
+            'requesterId': requester_id
+        })
+
+@socketio.on('cancel_join_request')
+def handle_cancel_join_request(data):
+    """Guest cancels pending join request."""
+    if not isinstance(data, dict):
+        return
+    request_id = data.get('requestId')
+    room = data.get('room')
+    user_id = get_current_user_id()
+    
+    cancelled = room_service.cancel_join_request(user_id, room, request_id)
+    if cancelled:
+        emit('join_request_cancelled', {'requestId': request_id, 'room': room})
+        room_meta = room_service.get_room_metadata(room)
+        if room_meta:
+            owner_id = room_meta.get('owner')
+            emit('room_join_request_cancelled', {'requestId': request_id, 'room': room}, to=f"user:{owner_id}")
+

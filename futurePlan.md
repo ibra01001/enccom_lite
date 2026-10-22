@@ -15,6 +15,7 @@
 
 1. Make it a globally persistent WebSocket connection with on-demand, room-based message history retrieval ... done
 2. fix logic of creating rooms all created rooms must be privet ... done
+3. Replace room link sharing with 12-character join codes (letters & digits) + owner accept/reject knock approval ... done
 
 ## Open Questions
 
